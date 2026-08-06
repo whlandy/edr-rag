@@ -1,0 +1,33 @@
+# Runtime artifacts
+logs/
+*.log
+*.log.*
+
+# Local CHM workspace artifacts
+work/
+tmp/
+extracted/
+normalized/
+action_catalog/
+vector_index/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local secrets/config
+.env
+.env.*
+*.local.json
+*.secret
+*.secrets
