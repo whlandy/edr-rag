@@ -10,6 +10,7 @@ extracted/
 normalized/
 action_catalog/
 vector_index/
+.llamaindex/
 
 # Python
 .venv/

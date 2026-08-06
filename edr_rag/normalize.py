@@ -27,7 +27,10 @@ import hashlib
 import json
 import logging
 import re
+import shutil
+import tempfile
 import unicodedata
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -88,6 +91,7 @@ def make_semantic_id(
     section_path: list[str],
     title: str,
     manual_id: str,
+    content: str = "",
 ) -> str:
     """Build a STABLE SEMANTIC id for a ManualSection.
 
@@ -111,9 +115,13 @@ def make_semantic_id(
         if sl:
             components.append(sl)
     if not components:
-        # Last resort — still deterministic via section_path/title attempt
-        components.append("orphan")
-    return f"manual.section.{'.'.join(components)}"
+        # Keep pathless/untitled pages distinct without deriving identity from
+        # their source filename. The content digest remains stable if a CHM is
+        # repacked with different internal paths.
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:12]
+        components.append(f"orphan_{digest}")
+    manual_slug = _slugify(manual_id) or "unknown"
+    return f"manual.{manual_slug}.section.{'.'.join(components)}"
 
 
 def make_asset_id(relative_path: str) -> str:
@@ -249,11 +257,31 @@ def run_ingest(
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
 
-    # 1. extract
+    # 1. Extract into a fresh sibling directory. Reusing the previous tree
+    # would retain pages/assets that were removed from a newer CHM.
     extracted_dir = workdir / "extracted"
-    source_hash, ok = extract_mod.extract_chm(Path(chm_path), extracted_dir)
-    if not ok:
-        raise RuntimeError(f"Failed to extract CHM: {chm_path}")
+    staging_dir = Path(tempfile.mkdtemp(prefix=".extracted-", dir=workdir))
+    try:
+        source_hash, ok = extract_mod.extract_chm(Path(chm_path), staging_dir)
+        if not ok:
+            raise RuntimeError(f"Failed to extract CHM: {chm_path}")
+
+        backup_dir: Optional[Path] = None
+        if extracted_dir.exists():
+            backup_dir = workdir / f".extracted-backup-{uuid.uuid4().hex}"
+            extracted_dir.rename(backup_dir)
+        try:
+            staging_dir.rename(extracted_dir)
+        except Exception:
+            if backup_dir is not None:
+                backup_dir.rename(extracted_dir)
+            raise
+        if backup_dir is not None:
+            shutil.rmtree(backup_dir)
+    except Exception:
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir)
+        raise
     extracted_dir = extracted_dir.resolve()
 
     # 2. parse TOC
@@ -264,6 +292,7 @@ def run_ingest(
 
     # 4. for each HTML, build ManualSection
     sections: list[ManualSection] = []
+    section_sources: dict[str, str] = {}
     # Track which assets each section references (for AssetRef.referenced_by)
     asset_referenced_by: dict[str, list[str]] = {}
 
@@ -305,7 +334,14 @@ def run_ingest(
             section_path=section_path,
             title=page.title,
             manual_id=manual_id,
+            content=page.content,
         )
+        if sid in section_sources:
+            raise ValueError(
+                f"Duplicate semantic section id {sid!r}: "
+                f"{section_sources[sid]!r} and {rel_path!r}"
+            )
+        section_sources[sid] = rel_path
 
         sections.append(
             ManualSection(

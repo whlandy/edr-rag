@@ -73,9 +73,12 @@ class JsonlCorpus:
         section_path = r.get("section_path") or []
         paths = " ".join(section_path)
         source = r.get("source") or {}
-        file = source.get("file") or r.get("source_file") or ""
+        source_ref = r.get("source_ref") or {}
+        file = source.get("file") or source_ref.get("relative_path") or r.get("source_file") or ""
         r["_searchable"] = " ".join([title, paths, file, text])
+        r["_searchable_lower"] = r["_searchable"].lower()
         r["_title"] = title
+        r["_title_lower"] = title.lower()
         r["_doc_id"] = r.get("id") or ""
         return r
 
@@ -97,12 +100,12 @@ class JsonlCorpus:
             return []
         scores: list[tuple[float, int]] = []
         for i, r in enumerate(self.records):
-            field = r["_searchable"]
+            field = r["_searchable_lower"]
             score = 0.0
             for t in q_tokens:
                 if t in field:
                     # title+path matches weighted higher
-                    weight = 3.0 if (t in r["_title"] or t in r.get("_searchable", "")[:200]) else 1.0
+                    weight = 3.0 if (t in r["_title_lower"] or t in field[:200]) else 1.0
                     score += field.count(t) * weight
             if score > 0:
                 scores.append((score, i))
@@ -138,7 +141,8 @@ class JsonlCorpus:
             "score": round(score, 3),
             "title": r["_title"],
             "source": r.get("source") or {
-                "file": r.get("source_file", ""),
+                "file": (r.get("source_ref") or {}).get("relative_path")
+                or r.get("source_file", ""),
             },
             "snippet": self._snippet(r),
         }

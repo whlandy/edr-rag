@@ -85,7 +85,7 @@ def test_semantic_id_from_section_path():
         title="ignored",
         manual_id="m",
     )
-    assert sid == "manual.section.网络.代理.配置代理服务器"
+    assert sid == "manual.m.section.网络.代理.配置代理服务器"
     print("[PASS] semantic id uses section_path")
 
 
@@ -95,7 +95,7 @@ def test_semantic_id_falls_back_to_title():
         title="Orphan Page",
         manual_id="m",
     )
-    assert sid == "manual.section.orphan_page"
+    assert sid == "manual.m.section.orphan_page"
     print("[PASS] semantic id falls back to title")
 
 
@@ -105,7 +105,7 @@ def test_semantic_id_orphan_when_all_empty():
         title="",
         manual_id="m",
     )
-    assert sid == "manual.section.orphan"
+    assert sid == "manual.m.section.orphan_e3b0c44298fc"
     print("[PASS] semantic id orphan fallback")
 
 
@@ -156,7 +156,7 @@ def test_semantic_id_skips_empty_components():
         title="x",
         manual_id="m",
     )
-    assert sid == "manual.section.网络.代理"
+    assert sid == "manual.m.section.网络.代理"
     print("[PASS] semantic id skips empty path components")
 
 
@@ -346,7 +346,7 @@ def test_run_ingest_semantic_ids_use_toc():
         assert "proxy.html" not in proxy_id
         assert ".html" not in proxy_id
         # id MUST be deterministic
-        assert proxy_id == "manual.section.网络.代理"
+        assert proxy_id == "manual.test_manual.section.网络.代理"
         print("[PASS] semantic id derived from TOC path, no path leakage")
 
 
@@ -370,7 +370,7 @@ def test_run_ingest_orphan_section_id():
         by_path = {s["source_ref"]["relative_path"]: s for s in sections}
         orphan_id = by_path["orphan.html"]["id"]
         # TOC gave it "Orphan" path → slug "orphan"
-        assert orphan_id == "manual.section.orphan"
+        assert orphan_id == "manual.test_manual.section.orphan"
         print("[PASS] orphan section gets semantic id from TOC")
 
 

@@ -28,7 +28,10 @@ docs/requirements/EDR-RAG-DESIGN.md
 Current CLI:
 
 ```bash
-edr-rag init-workdir
+python -m pip install -e '.[rag]'
+edr-rag index --workdir ~/Desktop/edr-chm-rag-work --type all
+edr-rag search --workdir ~/Desktop/edr-chm-rag-work \
+  --type section --strategy hybrid --query '如何设置网络代理'
 ```
 
 Default temporary workspace:

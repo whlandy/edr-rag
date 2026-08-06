@@ -6,10 +6,8 @@ Commands:
     P0 ingest: extract CHM + TOC + HTML → manifest.json + sections.jsonl + assets.jsonl
 
   python -m tools.edr_rag.cli validate --workdir <path> [--manual-id <id>]
-
-
-  python -m tools.edr_rag.cli search --query <text> [--workdir <path>] [options]
-    (Planned for P1 — not implemented yet)
+  edr-rag index --workdir <path> [--type all] [--embed-model <model>]
+  edr-rag search --workdir <path> --query <text> [--strategy hybrid]
 """
 
 from __future__ import annotations
@@ -81,6 +79,62 @@ def _cmd_validate(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def _cmd_index(args: argparse.Namespace) -> None:
+    from .vector import ARTIFACT_FILES, LlamaIndexStore, LlamaIndexUnavailableError
+
+    artifact_types = (
+        [kind for kind, filename in ARTIFACT_FILES.items() if (Path(args.workdir) / filename).exists()]
+        if args.type == "all" else [args.type]
+    )
+    if not artifact_types:
+        print(f"Error: no supported JSONL artifacts found in {args.workdir}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        counts = LlamaIndexStore(
+            args.workdir, embed_model=args.embed_model, index_dir=args.index_dir
+        ).build(artifact_types, show_progress=args.show_progress)
+    except (FileNotFoundError, ValueError, LlamaIndexUnavailableError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    print(json.dumps({"indexed": counts, "embed_model": args.embed_model}, ensure_ascii=False, indent=2))
+
+
+def _cmd_search(args: argparse.Namespace) -> None:
+    from .p1.search import JsonlCorpus
+    from .vector import (
+        ARTIFACT_FILES,
+        LlamaIndexStore,
+        LlamaIndexUnavailableError,
+        reciprocal_rank_fusion,
+    )
+
+    source = Path(args.workdir) / ARTIFACT_FILES[args.type]
+    lexical = []
+    if args.strategy in ("keyword", "bm25", "hybrid"):
+        if not source.exists():
+            print(f"Error: missing artifact: {source}", file=sys.stderr)
+            sys.exit(1)
+        corpus = JsonlCorpus.from_file(source)
+        method = corpus.keyword_search if args.strategy == "keyword" else corpus.bm25_search
+        lexical = method(args.query, limit=args.limit * 2)
+
+    semantic = []
+    if args.strategy in ("vector", "hybrid"):
+        try:
+            semantic = LlamaIndexStore(
+                args.workdir, embed_model=args.embed_model, index_dir=args.index_dir
+            ).search(args.query, args.type, limit=args.limit * 2)
+        except (FileNotFoundError, LlamaIndexUnavailableError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+    if args.strategy == "hybrid":
+        results = reciprocal_rank_fusion(lexical, semantic, limit=args.limit)
+    else:
+        results = (semantic or lexical)[:args.limit]
+    print(json.dumps(results, ensure_ascii=False, indent=2))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="CHM ingestion pipeline — P0: extract, parse, normalize",
@@ -103,6 +157,27 @@ def main() -> None:
                                  help="Working directory (default: ~/Desktop/edr-chm-rag-work)")
     validate_parser.add_argument("--manual-id", default=None, help="Expected manual_id for validation")
 
+    # LlamaIndex vector index
+    index_parser = subparsers.add_parser("index", help="Build persisted LlamaIndex vector indexes")
+    index_parser.add_argument("--workdir", required=True, help="Work directory containing JSONL artifacts")
+    index_parser.add_argument("--type", default="all",
+                              choices=["all", "section", "procedure", "step", "action"])
+    index_parser.add_argument("--embed-model", default="BAAI/bge-small-zh-v1.5",
+                              help="Hugging Face embedding model name")
+    index_parser.add_argument("--index-dir", default=None, help="Index directory (default: WORKDIR/.llamaindex)")
+    index_parser.add_argument("--show-progress", action="store_true", help="Show embedding progress")
+
+    search_parser = subparsers.add_parser("search", help="Keyword, BM25, vector, or hybrid search")
+    search_parser.add_argument("--workdir", required=True)
+    search_parser.add_argument("--query", required=True)
+    search_parser.add_argument("--type", default="section",
+                               choices=["section", "procedure", "step", "action"])
+    search_parser.add_argument("--strategy", default="hybrid",
+                               choices=["keyword", "bm25", "vector", "hybrid"])
+    search_parser.add_argument("--limit", type=int, default=5)
+    search_parser.add_argument("--embed-model", default="BAAI/bge-small-zh-v1.5")
+    search_parser.add_argument("--index-dir", default=None)
+
     args = parser.parse_args()
     _configure_logging(args.verbose)
 
@@ -110,6 +185,10 @@ def main() -> None:
         _cmd_ingest(args)
     elif args.command == "validate":
         _cmd_validate(args)
+    elif args.command == "index":
+        _cmd_index(args)
+    elif args.command == "search":
+        _cmd_search(args)
     else:
         parser.print_help()
         sys.exit(1)

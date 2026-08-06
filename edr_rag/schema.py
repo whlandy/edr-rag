@@ -7,7 +7,7 @@ Defines the data contracts for CHM ingestion output artifacts:
 
 Identity model (locked in P0):
   - `id` is the SEMANTIC identity of a section (stable across re-ingestions).
-    Example: "manual.section.network.proxy".
+    Example: "manual.product_manual.section.network.proxy".
     Downstream P1/P2 (embedding, retrieval, action lookup) keys on this.
   - `source_ref` carries the EXTRACTION artifact identity (where the section
     was found in this particular extraction). It may legitimately change

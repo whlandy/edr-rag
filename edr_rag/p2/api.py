@@ -86,6 +86,7 @@ class EdrRagAPI:
         limit: int = 5,
         risk_filter: Optional[str] = None,
         status_filter: Optional[str] = None,
+        scoring: str = "keyword",
     ) -> list[dict]:
         """Search the action catalog.
 
@@ -119,13 +120,15 @@ class EdrRagAPI:
                 action.get("module", ""),
                 " ".join(action.get("preconditions", [])),
                 " ".join(s.get("source_instruction", "") for s in action.get("procedure", [])),
-            ])
+            ]).lower()
+            title = action.get("title", "").lower()
+            action_id = action.get("action_id", "").lower()
 
             score = 0.0
             for t in query_tokens:
                 if t in searchable:
                     # Title and action_id matches weighted higher
-                    weight = 3.0 if (t in action.get("title", "") or t in action.get("action_id", "")) else 1.0
+                    weight = 3.0 if (t in title or t in action_id) else 1.0
                     score += searchable.count(t) * weight
 
             if score > 0:
@@ -154,7 +157,29 @@ class EdrRagAPI:
                 "snippet": snippet,
             })
 
-        return results
+        if scoring == "keyword":
+            return results
+        if scoring not in ("vector", "hybrid"):
+            raise ValueError(f"Unsupported scoring strategy: {scoring}")
+        from ..vector import LlamaIndexStore, reciprocal_rank_fusion
+        semantic = LlamaIndexStore(self.workdir).search(query, "action", limit=limit * 2)
+        allowed = {
+            action.get("action_id", "") for action in actions
+            if (not risk_filter or action.get("risk") == risk_filter)
+            and (not status_filter or action.get("status") == status_filter)
+        }
+        semantic = [result for result in semantic if result["id"] in allowed]
+        actions_by_id = {action.get("action_id", ""): action for action in actions}
+        for result in semantic:
+            action = actions_by_id[result["id"]]
+            result.update({
+                "risk": action.get("risk", ""),
+                "status": action.get("status", ""),
+                "confidence": action.get("confidence", 0.0),
+            })
+        if scoring == "vector":
+            return semantic[:limit]
+        return reciprocal_rank_fusion(results, semantic, limit=limit)
 
     def get_action(self, action_id: str) -> Optional[dict]:
         """Get the full action catalog entry by action_id (stripped).
@@ -202,6 +227,13 @@ class EdrRagAPI:
         if not corpus:
             return []
 
+        if scoring in ("vector", "hybrid"):
+            from ..vector import LlamaIndexStore, reciprocal_rank_fusion
+            semantic = LlamaIndexStore(self.workdir).search(query, "procedure", limit=limit * 2)
+            if scoring == "vector":
+                return semantic[:limit]
+            lexical = corpus.bm25_search(query, limit=limit * 2)
+            return reciprocal_rank_fusion(lexical, semantic, limit=limit)
         if scoring == "bm25":
             return corpus.bm25_search(query, limit=limit)
         return corpus.keyword_search(query, limit=limit)
@@ -228,6 +260,13 @@ class EdrRagAPI:
         if not corpus:
             return []
 
+        if scoring in ("vector", "hybrid"):
+            from ..vector import LlamaIndexStore, reciprocal_rank_fusion
+            semantic = LlamaIndexStore(self.workdir).search(query, "section", limit=limit * 2)
+            if scoring == "vector":
+                return semantic[:limit]
+            lexical = corpus.bm25_search(query, limit=limit * 2)
+            return reciprocal_rank_fusion(lexical, semantic, limit=limit)
         if scoring == "bm25":
             return corpus.bm25_search(query, limit=limit)
         return corpus.keyword_search(query, limit=limit)

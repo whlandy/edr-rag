@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -139,7 +140,7 @@ class EdrRagAgent:
 
         Returns feedback_id.
         """
-        feedback_id = feedback.get("feedback_id", f"fb_{int(datetime.now().timestamp())}")
+        feedback_id = feedback.get("feedback_id") or f"fb_{uuid.uuid4().hex}"
         item = FeedbackItem(
             feedback_id=feedback_id,
             manual_id=feedback.get("manual_id", ""),

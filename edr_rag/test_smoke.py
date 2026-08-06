@@ -137,7 +137,7 @@ def main() -> int:
             by_path = {s["source_ref"]["relative_path"]: s for s in sections}
 
             # proxy.html: should have TOC section_path ["网络", "代理"],
-            # semantic id "manual.section.网络.代理"
+            # semantic id "manual.test_manual.section.网络.代理"
             proxy = by_path["network/proxy.html"]
             check("proxy section_path", proxy["section_path"] == ["网络", "代理"],
                   f"got {proxy['section_path']}")
@@ -158,14 +158,14 @@ def main() -> int:
             index = by_path["network/index.html"]
             check("index section_path", index["section_path"] == ["网络"],
                   f"got {index['section_path']}")
-            check("index id", index["id"] == "manual.section.网络",
+            check("index id", index["id"] == "manual.test_manual.section.网络",
                   f"got {index['id']}")
 
             # status.html: TOC path ["安全状态"], no nested
             status = by_path["status.html"]
             check("status section_path", status["section_path"] == ["安全状态"],
                   f"got {status['section_path']}")
-            check("status id", status["id"] == "manual.section.安全状态",
+            check("status id", status["id"] == "manual.test_manual.section.安全状态",
                   f"got {status['id']}")
 
             # --- Asset checks ---
