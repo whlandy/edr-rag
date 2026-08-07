@@ -101,6 +101,68 @@ def _cmd_validate_index(args: argparse.Namespace) -> None:
     sys.exit(1)
 
 
+def _cmd_index(sub_args: argparse.Namespace) -> None:
+    """Index version management (P3-5): list / capture / rollback."""
+    from .index_versioning import (
+        activate_version,
+        capture_version,
+        load_versions,
+        rollback,
+    )
+
+    workdir = Path(sub_args.workdir).expanduser().resolve()
+
+    if sub_args.action == "list":
+        registry = load_versions(workdir)
+        if not registry:
+            print(f"无索引版本记录 ({workdir / 'index_versions.json'})")
+            return
+        for corpus in sorted(registry):
+            print(f"[{corpus}]")
+            for v in registry[corpus]:
+                mark = "  (active)" if v.active else ""
+                print(
+                    f"  v{v.version_id}{mark} built_at={v.built_at} "
+                    f"records={len(v.fingerprints)} source_hash={v.source_hash[:12] or '-'}"
+                )
+        return
+
+    if sub_args.action == "capture":
+        corpus = sub_args.corpus
+        ver, _p = capture_version(
+            workdir,
+            corpus=corpus,
+            source_hash=sub_args.source_hash or "",
+            keep_history=not sub_args.drop_history,
+        )
+        print(f"captured {corpus} -> v{ver.version_id} (active)")
+        return
+
+    if sub_args.action == "rollback":
+        corpus = sub_args.corpus
+        target = rollback(workdir, corpus=corpus)
+        if target is None:
+            print(
+                f"无法回滚 {corpus}: 无版本历史或未找到回滚目标",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print(f"rolled back {corpus} -> v{target.version_id} (active)")
+        return
+
+    if sub_args.action == "activate":
+        corpus = sub_args.corpus
+        target = activate_version(workdir, corpus=corpus, version_id=sub_args.version)
+        if target is None:
+            print(
+                f"未找到 {corpus} 的 v{sub_args.version}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print(f"activated {corpus} -> v{target.version_id} (active)")
+        return
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="CHM ingestion pipeline — P0: extract, parse, normalize",
@@ -131,6 +193,32 @@ def main() -> None:
     vi_parser.add_argument("--artifact", dest="artifacts", action="append", default=None,
                            help="Artifact filename(s) to hash-check (repeatable; default: all tracked)")
 
+    # index (P3-5: 版本灰度切换 / 回滚)
+    index_parser = subparsers.add_parser(
+        "index",
+        help="Index version management (P3-5): list / capture / rollback / activate",
+    )
+    index_sub = index_parser.add_subparsers(dest="action", required=True)
+
+    idx_list = index_sub.add_parser("list", help="List index versions per corpus")
+    idx_list.add_argument("--workdir", required=True, help="Work directory")
+
+    idx_cap = index_sub.add_parser("capture", help="Capture a new version for a corpus (becomes active)")
+    idx_cap.add_argument("--workdir", required=True, help="Work directory")
+    idx_cap.add_argument("--corpus", required=True, help="Corpus type, e.g. chunks / procedures / actions")
+    idx_cap.add_argument("--source-hash", default="", help="Source hash at build time")
+    idx_cap.add_argument("--drop-history", action="store_true",
+                         help="Discard older versions for this corpus (disable rollback)")
+
+    idx_roll = index_sub.add_parser("rollback", help="Roll back a corpus to the previous version")
+    idx_roll.add_argument("--workdir", required=True, help="Work directory")
+    idx_roll.add_argument("--corpus", required=True, help="Corpus type")
+
+    idx_act = index_sub.add_parser("activate", help="Activate a specific version of a corpus")
+    idx_act.add_argument("--workdir", required=True, help="Work directory")
+    idx_act.add_argument("--corpus", required=True, help="Corpus type")
+    idx_act.add_argument("--version", type=int, required=True, help="Version id to activate")
+
     args = parser.parse_args()
     _configure_logging(args.verbose)
 
@@ -140,6 +228,8 @@ def main() -> None:
         _cmd_validate(args)
     elif args.command == "validate-index":
         _cmd_validate_index(args)
+    elif args.command == "index":
+        _cmd_index(args)
     else:
         parser.print_help()
         sys.exit(1)

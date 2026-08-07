@@ -103,6 +103,40 @@ class VectorStore(ABC):
         """释放底层连接/资源 (外部后端需要时覆盖)。"""
 
 
+@dataclass
+class IncrementalIndexResult:
+    """一次增量索引 (index_records_incremental) 的结果报告 (P3-5)。
+
+    Attributes:
+        added: 新增记录主键 (上次未见)。
+        updated: 内容指纹变化、需要重新嵌入的记录主键。
+        removed: 上次存在但本次已消失、需要从存储删除的记录主键。
+        unchanged: 内容未变、直接跳过的记录主键 (省去重新嵌入)。
+    """
+
+    added: list[str] = field(default_factory=list)
+    updated: list[str] = field(default_factory=list)
+    removed: list[str] = field(default_factory=list)
+    unchanged: list[str] = field(default_factory=list)
+
+    @property
+    def total_changed(self) -> int:
+        """实际产生写入/删除操作的记录数 (added + updated + removed)。"""
+        return len(self.added) + len(self.updated) + len(self.removed)
+
+
+def _record_fingerprint(r: dict, text_field: str) -> str:
+    """对单条记录的嵌入文本计算稳定指纹 (sha1)，用于增量变更判定。
+
+    P3-5: 相比整批 _content_sig，逐条指纹能让「按源 hash 只重索引变更部分」
+    成立——语料里只有少量记录变化时，仅需重嵌入变化的那几条。
+    """
+    import hashlib
+
+    text = r.get(text_field) or r.get("text") or r.get("content") or ""
+    return hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest()
+
+
 class VectorIndex:
     """桥接「文档记录 + embedder」与 VectorStore 的辅助类。
 
@@ -113,6 +147,12 @@ class VectorIndex:
 
     本类不缓存文档向量——缓存的职责交给 embedder (见 p1.search._cached_vec)，
     以保证不引入重复的全局状态。
+
+    P3-5: 提供两种索引方式——
+      - index_records            : 整批重建 (缺省按整批内容签名短路)；
+      - index_records_incremental: 增量更新。调用方传入上一次的 id->指纹映射，
+        仅重嵌入「新增/内容变化」的记录，删除「已消失」的记录，未变记录直接
+        跳过，避免大语料下反复全量嵌入。
     """
 
     def __init__(
@@ -133,7 +173,7 @@ class VectorIndex:
         id_field: str = "id",
         force: bool = False,
     ) -> int:
-        """把一批记录经 embedder 嵌入并写入存储。
+        """把一批记录经 embedder 嵌入并写入存储 (整批重建)。
 
         Args:
             records: 已规范化的 JsonlCorpus.records (含 _searchable 等内部字段)。
@@ -148,6 +188,27 @@ class VectorIndex:
         if not force and self._indexed_sig == sig:
             return self.count()
         self.store.delete(_all_ids(self.store))
+        n = self._embed_upsert(records, text_field, id_field)
+        self._indexed_sig = sig
+        return n
+
+    def _embed_upsert(
+        self,
+        records: list[dict],
+        text_field: str,
+        id_field: str,
+        doc_indices: Optional[list[int]] = None,
+    ) -> int:
+        """把一批记录嵌入并 upsert 进 store，返回实际写入 (含替换) 条数。
+
+        不清理既有记录、不碰内容签名——仅供 index_records / 增量索引内部复用。
+
+        Args:
+            doc_indices: 可选，与 `records` 等长的、每条记录在**完整语料**中的
+                位置 (doc_idx)。缺省时用本条记录在 `records` 内的下标。
+                JsonlCorpus 依赖 doc_idx 精确映射回 self.records，因此增量索引
+                重嵌入子集时必须显式传入原始位置 (P3-5)。
+        """
         vector_records = []
         for i, r in enumerate(records):
             text = r.get(text_field) or r.get("text") or r.get("content") or ""
@@ -157,7 +218,8 @@ class VectorIndex:
             if not vec:
                 continue
             rec_id = str(r.get(id_field) or f"rec_{i}")
-            meta: dict[str, Any] = {"doc_idx": i, "id": rec_id}
+            real_idx = doc_indices[i] if doc_indices is not None else i
+            meta: dict[str, Any] = {"doc_idx": real_idx, "id": rec_id}
             meta.update(r.get("metadata") or {})
             vector_records.append(
                 VectorRecord(
@@ -167,9 +229,78 @@ class VectorIndex:
                     text=text,
                 )
             )
-        n = self.store.upsert(vector_records) if vector_records else self.count()
-        self._indexed_sig = sig
-        return n
+        return self.store.upsert(vector_records) if vector_records else 0
+
+    def index_records_incremental(
+        self,
+        records: list[dict],
+        known: Optional[dict[str, str]] = None,
+        text_field: str = "_searchable",
+        id_field: str = "id",
+    ) -> tuple[IncrementalIndexResult, dict[str, str]]:
+        """按「源 hash/内容指纹」增量更新索引，只重索引变更部分 (P3-5)。
+
+        对比上一轮的 id->内容指纹映射 `known`，得出四类记录：
+          - 新增 (added)     : 本次新出现，需嵌入；
+          - 变化 (updated)   : 内容指纹不同，需重新嵌入；
+          - 消失 (removed)   : 从存储删除；
+          - 未变 (unchanged) : 跳过，不重嵌入 (省去反复嵌入的开销)。
+        仅对 added+updated 做嵌入、对 removed 做删除；未变记录保持原向量不动。
+
+        Args:
+            records: 当前语料记录列表。
+            known: 上一轮的 {记录主键: 内容指纹} 映射；None/空表示首次全量。
+            text_field: 嵌入文本字段。
+            id_field: 主键字段；缺失时回退为 'rec_{doc_idx}'。
+
+        Returns:
+            (result, new_known)——result 为本次变更报告；new_known 为全新的
+            {主键: 指纹} 映射，调用方应持久化，供下一轮增量使用。
+        """
+        known = known or {}
+        new_known: dict[str, str] = {}
+        by_id: dict[str, dict] = {}
+        orig_index: dict[str, int] = {}
+        added: list[str] = []
+        updated: list[str] = []
+        unchanged: list[str] = []
+
+        for i, r in enumerate(records):
+            rec_id = str(r.get(id_field) or f"rec_{i}")
+            fp = _record_fingerprint(r, text_field)
+            new_known[rec_id] = fp
+            by_id[rec_id] = r
+            orig_index[rec_id] = i
+            if rec_id not in known:
+                added.append(rec_id)
+            elif known[rec_id] != fp:
+                updated.append(rec_id)
+            else:
+                unchanged.append(rec_id)
+
+        removed = [rid for rid in known if rid not in new_known]
+
+        # 只重嵌入新增 + 变化的部分；消失的记录从存储删除。
+        changed_ids = added + updated
+        to_index = [by_id[rid] for rid in changed_ids]
+        # 关键: doc_idx 是记录在**完整语料**中的位置，不是子集内位置——
+        # JsonlCorpus 依靠它映射回 self.records (P3-5)。
+        doc_indices = [orig_index[rid] for rid in changed_ids]
+        if to_index:
+            self._embed_upsert(to_index, text_field, id_field, doc_indices=doc_indices)
+        if removed:
+            self.store.delete(removed)
+
+        # 让 index_records 的整批签名短路与新状态一致，避免紧随其后的
+        # 全量重建被误触发。
+        self._indexed_sig = _content_sig(records, text_field)
+
+        return (
+            IncrementalIndexResult(
+                added=added, updated=updated, removed=removed, unchanged=unchanged
+            ),
+            new_known,
+        )
 
     def search(
         self,

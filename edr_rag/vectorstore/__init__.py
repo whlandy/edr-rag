@@ -10,7 +10,13 @@
 
 from __future__ import annotations
 
-from .base import VectorHit, VectorIndex, VectorRecord, VectorStore
+from .base import (
+    IncrementalIndexResult,
+    VectorHit,
+    VectorIndex,
+    VectorRecord,
+    VectorStore,
+)
 from .backends import (
     ElasticsearchVectorStore,
     MilvusVectorStore,
@@ -22,6 +28,7 @@ from .factory import build_vector_store, get_vector_store
 from .simple import SimpleVectorStore
 
 __all__ = [
+    "IncrementalIndexResult",
     "VectorHit",
     "VectorIndex",
     "VectorRecord",
