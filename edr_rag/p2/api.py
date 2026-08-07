@@ -250,6 +250,67 @@ class EdrRagAPI:
         ).to_jsonl()
 
 
+    # ---------- AskAnswer: 结构化答案的 agent 消费入口 (P2-4) ----------
+
+    def ask_answer(
+        self,
+        user_request: str,
+        llm: Optional[Callable] = None,
+        limit: int = 5,
+        strategy: str = "keyword",
+        min_confidence: Optional[float] = None,
+    ) -> dict:
+        """AskAnswer：把问题检索并合成为结构化答案，供 agent/规划器消费 (P2-4)。
+
+        与 `synthesize` 等价，但返回字典额外带便捷字段，让 agent 无需自己从
+        steps/citations 重新聚合即可拿到:
+          - dangerous:  bool — 是否涉及高风险或需要人工确认（requires_confirmation
+                        或 answer_status=='conflict'）。agent 可据此决定是否把
+                        控制权交给人 / 降低自动化程度。
+          - sources:    所有来源 file 的列表（去重），便于 agent 追溯。
+
+        结构化字段（steps/risk/preconditions/warnings/assertions/answer_status 等）
+        与 `synthesize` 完全一致，agent 应优先消费这些字段而不仅是 `answer` 文本。
+        """
+        result = self.synthesize(
+            user_request,
+            llm=llm,
+            limit=limit,
+            strategy=strategy,
+            min_confidence=min_confidence,
+        )
+        return _augment_ask_answer(result)
+
+
+def _augment_ask_answer(result: dict) -> dict:
+    """在 synthesize 的结构化结果上追加 agent 便捷字段 (P2-4)。"""
+    out = dict(result)
+    # dangerous: 需要人工确认或检测到冲突 → 视为高风险，agent 应保守处理。
+    out["dangerous"] = bool(
+        out.get("requires_confirmation") or out.get("answer_status") == "conflict"
+    )
+    # sources: 聚合所有步骤/警告/断言的来源 file，去重保序
+    files: list[str] = []
+    seen: set[str] = set()
+    for s in out.get("steps") or []:
+        f = (s.get("source") or {}).get("file", "")
+        if f and f not in seen:
+            seen.add(f)
+            files.append(f)
+    for w in out.get("warning_sources") or []:
+        f = (w or {}).get("file", "")
+        if f and f not in seen:
+            seen.add(f)
+            files.append(f)
+    for a in out.get("assertions") or []:
+        f = (a.get("source") or {}).get("file", "")
+        if f and f not in seen:
+            seen.add(f)
+            files.append(f)
+    out["sources"] = files
+    return out
+
+
 def _enrich_action_details(service, context: dict) -> dict:
     """把薄形状的动作检索结果补全为全量动作记录。
 

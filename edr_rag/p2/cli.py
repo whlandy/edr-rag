@@ -164,7 +164,9 @@ def _cli_answer(args: argparse.Namespace):
     print()
     print(f"[generated_by={result['generated_by']} confidence={result['confidence']} "
           f"requires_confirmation={str(result['requires_confirmation']).lower()} "
-          f"answer_status={result['answer_status']}]")
+          f"answer_status={result['answer_status']} "
+          f"steps={len(result.get('steps') or [])} "
+          f"preconditions={len(result.get('preconditions') or [])}]")
 
 
 def main():

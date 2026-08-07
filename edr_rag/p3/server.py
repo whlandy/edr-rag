@@ -129,6 +129,23 @@ class EdrRagAgent:
         """Retrieve a specific procedure by id."""
         return self.retrieval.get("procedures", procedure_id, key_field="id")
 
+    # ----- AskAnswer: 结构化答案 (P2-4) -----
+
+    def ask_answer(self, query: str, limit: int = 5, strategy: str = "keyword",
+                   min_confidence: Optional[float] = None) -> dict:
+        """AskAnswer：检索并合成为结构化答案，供 agent/规划器消费 (P2-4)。
+
+        返回结构化答案 dict（steps/risk/preconditions/warnings/assertions/
+        answer_status/confidence/requires_confirmation/dangerous/sources 等），
+        让 agent 消费结构化字段而不只是纯文本。缺依赖时自动降级到 keyword。
+        """
+        from edr_rag.p2.api import EdrRagAPI
+
+        api = EdrRagAPI(self.workdir)
+        return api.ask_answer(
+            query, limit=limit, strategy=strategy, min_confidence=min_confidence
+        )
+
     # ----- Feedback tools -----
 
     def capture_feedback(self, feedback: dict) -> str:
@@ -351,6 +368,23 @@ def create_mcp_server(workdir: str) -> Server:
                 },
             ),
             types.Tool(
+                name="ask",
+                description=("AskAnswer (P2-4): 检索并合成一个「结构化答案」，返回 steps / "
+                             "preconditions / warnings / risk / confidence / answer_status / "
+                             "sources 等结构化字段。agent 应消费这些字段而不是纯文本 answer。"
+                             "这是把问题变成可执行计划的首选入口。"),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "User request / question (CJK-safe)"},
+                        "limit": {"type": "integer", "description": "Retrieval limit per tier", "default": 5},
+                        "strategy": _STRATEGY_PROP,
+                        "min_confidence": {"type": "number", "description": "证据不足拒答的置信度阈值 (P2-3, 默认 0.4)", "default": None},
+                    },
+                    "required": ["query"],
+                },
+            ),
+            types.Tool(
                 name="capture_feedback",
                 description="Capture execution feedback for later analysis and catalog improvement. Edr-wd should call this after each action attempt.",
                 inputSchema={
@@ -437,6 +471,13 @@ def create_mcp_server(workdir: str) -> Server:
             elif name == "get_procedure":
                 result = agent.get_procedure(arguments["procedure_id"])
                 results = result if result else {"error": "not found"}
+            elif name == "ask":
+                results = agent.ask_answer(
+                    arguments["query"],
+                    limit=arguments.get("limit", 5),
+                    strategy=arguments.get("strategy", "keyword"),
+                    min_confidence=arguments.get("min_confidence"),
+                )
             elif name == "capture_feedback":
                 fb_id = agent.capture_feedback(arguments)
                 results = {"feedback_id": fb_id, "status": "captured"}
