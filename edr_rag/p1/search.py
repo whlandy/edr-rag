@@ -107,6 +107,26 @@ def _cosine(a: list[float], b: list[float]) -> float:
     return dot / (na * nb)
 
 
+#: P3-1: 进程内共享的 VectorIndex (按 vector store 实例缓存)。复用同一
+#: VectorIndex 后，VectorIndex.index_records 的签名短路径可避免对同一语料
+#: 反复重新嵌入——与既有 _cached_vec 的全局文档向量缓存语义保持一致，保证
+#: 重复检索不退化性能；换后端时 (get_vector_store 返回新 store) 自动换新。
+_INDEX_CACHE: dict[int, Any] = {}
+
+
+def _get_shared_index(embed_fn: Callable[[str], list[float]]):
+    """返回 (store 对应的) 进程内共享 VectorIndex，惰性创建。"""
+    from edr_rag.vectorstore import VectorIndex, get_vector_store
+
+    store = get_vector_store()
+    key = id(store)
+    idx = _INDEX_CACHE.get(key)
+    if idx is None:
+        idx = VectorIndex(store, embed_fn)
+        _INDEX_CACHE[key] = idx
+    return idx
+
+
 # ---------- Corpus ----------
 
 class JsonlCorpus:
@@ -223,12 +243,14 @@ class JsonlCorpus:
         return [self._to_result(i, s) for i, s in ranked[:limit]]
 
     def vector_search(self, query: str, limit: int = 5) -> list[dict]:
-        """Embedding-based retrieval via optional dependencies.
+        """Embedding-based retrieval via the pluggable vector store (P3-1).
 
-        Uses LlamaIndex + a BGE reranker when the optional `rag` extras are
-        installed. If they are missing, gracefully degrades to BM25 so the
-        main retrieval chain never errors. This keeps the standalone keyword
-        / BM25 path as the always-available fallback.
+        Uses LlamaIndex + a BGE embedder when the optional `rag` extras are
+        installed, indexing this corpus's records into the configured vector
+        backend (default: SimpleVectorStore, in-memory cosine). If the optional
+        deps are missing, gracefully degrades to BM25 so the main retrieval
+        chain never errors. The configured backend is determined by
+        EDR_RAG_VECTOR_BACKEND (see edr_rag/vectorstore).
         """
         embed_fn = _optional_embedder()
         if embed_fn is None:
@@ -237,16 +259,14 @@ class JsonlCorpus:
             return self.bm25_search(query, limit=limit)
 
         try:
-            q_vec = embed_fn(query)
-            scored = []
-            for i, r in enumerate(self.records):
-                vec = _cached_vec(embed_fn, r["_searchable"])
-                if vec is None:
-                    continue
-                score = _cosine(q_vec, vec)
-                scored.append((score, i))
-            scored.sort(key=lambda x: -x[0])
-            return [self._to_result(i, s) for s, i in scored[:limit]]
+            index = _get_shared_index(embed_fn)
+            index.index_records(
+                self.records,
+                text_field="_searchable",
+                id_field="_doc_id",
+            )
+            hits = index.search(query, top_k=limit)
+            return [self._to_result(doc_idx, score) for score, doc_idx in hits]
         except Exception:  # pragma: no cover - optional path only
             logger.warning("vector_search failed; falling back to BM25", exc_info=True)
             return self.bm25_search(query, limit=limit)
