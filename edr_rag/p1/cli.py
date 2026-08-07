@@ -158,6 +158,33 @@ def _cli_ingest_llama(args: argparse.Namespace):
         print(f"  note               = {result.error}")
 
 
+def _cli_build_nodes(args: argparse.Namespace):
+    """构建结构化节点（章节/Procedure/Step/Action 分层），写出 nodes.jsonl。"""
+    from .nodes import (
+        build_context_window,
+        build_structured_nodes_file,
+        load_structured_nodes,
+    )
+
+    workdir = Path(args.workdir)
+    nodes, nodes_path = build_structured_nodes_file(workdir)
+    counts = {"section": 0, "procedure": 0, "step": 0, "action": 0}
+    for n in nodes:
+        counts[n.level] = counts.get(n.level, 0) + 1
+    print(f"built {len(nodes)} structured nodes -> {nodes_path}")
+    for lvl in ("section", "procedure", "step", "action"):
+        print(f"  {lvl:<10} {counts.get(lvl, 0)}")
+
+    if args.context and nodes:
+        loaded = load_structured_nodes(nodes_path)
+        node = loaded[0]
+        window = build_context_window(node.id, loaded)
+        print(f"\ncontext window for {node.id} ({node.level}):")
+        for w in window:
+            print(f"  [{w.level}] {w.id}")
+            print("     " + (w.text[:60].replace("\n", " ") if w.text else ""))
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="P1: procedure extraction and local search CLI",
@@ -204,6 +231,15 @@ def main():
     il_parser.add_argument("--force-llama", action="store_true",
                            help="Require LlamaIndex; fail instead of degrading if absent")
 
+    # build-nodes (P1-2: 结构化 node 分层)
+    bn_parser = subparsers.add_parser(
+        "build-nodes",
+        help="Build structured nodes (section/procedure/step/action) from artifacts",
+    )
+    bn_parser.add_argument("--workdir", required=True, help="Work directory (same as P0 --workdir)")
+    bn_parser.add_argument("--context", action="store_true",
+                           help="Print a context window for the first node as a demo")
+
     args = parser.parse_args()
     if not args.subcommand:
         parser.print_help()
@@ -215,6 +251,8 @@ def main():
         _cli_search(args)
     elif args.subcommand == "ingest-llama":
         _cli_ingest_llama(args)
+    elif args.subcommand == "build-nodes":
+        _cli_build_nodes(args)
 
 
 if __name__ == "__main__":
