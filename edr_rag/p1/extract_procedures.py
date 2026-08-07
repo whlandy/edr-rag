@@ -611,18 +611,15 @@ def write_p1_artifacts(
     import json
     from datetime import datetime, timezone
 
+    from ..atomic_io import atomic_write_text, write_jsonl
     from ..index_manifest import maintain_index
 
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
 
-    with (workdir / "procedures.jsonl").open("w", encoding="utf-8") as f:
-        for p in procedures:
-            f.write(json.dumps(p.to_jsonl(), ensure_ascii=False) + "\n")
-
-    with (workdir / "chunks.jsonl").open("w", encoding="utf-8") as f:
-        for c in chunks:
-            f.write(json.dumps(c.to_jsonl(), ensure_ascii=False) + "\n")
+    # P0-6: 原子写入——临时文件 + rename，重建中途失败不污染现有产物。
+    write_jsonl(workdir / "procedures.jsonl", procedures)
+    write_jsonl(workdir / "chunks.jsonl", chunks)
 
     meta = {
         "manual_id": manual_id,
@@ -634,7 +631,9 @@ def write_p1_artifacts(
         "extraction_version": "p1",
     }
     meta_path = workdir / "p1_metadata.json"
-    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_text(
+        meta_path, json.dumps(meta, ensure_ascii=False, indent=2)
+    )
 
     # P0-5: maintain index manifest so downstream can detect staleness.
     maintain_index(

@@ -46,6 +46,19 @@ _ALLOWED_STRATEGIES = ("keyword", "bm25", "vector", "hybrid")
 # 后续接入 keyword+vector 融合时只需改进 _resolve_strategy。
 _DEFAULT_STRATEGY = "keyword"
 
+#: 缓存签名类型：用文件 mtime(纳秒)+size 做廉价失效判断，避免每次调用重读 JSONL。
+#: mtime/size 任一变化即视为文件已重建，触发重载并重建内存索引。
+_CacheSig = tuple[int, int] | None  # (st_mtime_ns, st_size)；文件缺失为 None
+
+
+def _file_signature(path: Path) -> _CacheSig:
+    """返回文件 (mtime_ns, size) 签名；文件不存在时返回 None。"""
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
 
 class RetrievalService:
     """统一检索服务。
@@ -56,7 +69,8 @@ class RetrievalService:
 
     def __init__(self, workdir: str | Path):
         self.workdir = Path(workdir)
-        self._corpora: dict[str, JsonlCorpus | None] = {
+        # 每个 corpus_type 缓存 None(未加载/文件缺失) 或 (签名, corpus)。
+        self._corpora: dict[str, tuple[_CacheSig, JsonlCorpus] | None] = {
             "sections": None,
             "procedures": None,
             "actions": None,
@@ -66,21 +80,33 @@ class RetrievalService:
     # ---------- Corpus 懒加载 ----------
 
     def _corpus(self, corpus_type: str) -> Optional[JsonlCorpus]:
-        """按 corpus_type 返回缓存 corpus；文件不存在或为空时返回 None。"""
+        """按 corpus_type 返回缓存 corpus；文件不存在或为空时返回 None。
+
+        P0-6: 以文件 (mtime_ns, size) 签名做失效判断——同一服务实例多次检索
+        时不重复读文件/重建索引；一旦 JSONL 被重建 (例如新跑一遍 ingest)，
+        签名变化即自动重载，无需重建整个服务。
+        """
         if corpus_type not in _CORPUS_FILES:
             raise ValueError(
                 f"unknown corpus_type '{corpus_type}'; "
                 f"expected one of {sorted(_CORPUS_FILES)}"
             )
-        cached = self._corpora.get(corpus_type)
-        if cached is not None:
-            return cached
         path = self.workdir / _CORPUS_FILES[corpus_type]
-        if not path.exists():
+        sig = _file_signature(path)
+
+        entry = self._corpora.get(corpus_type)
+        if entry is not None and entry[0] == sig:
+            # 命中：签名未变，直接复用内存中的 corpus (含已建好的索引)。
+            return entry[1]
+
+        if sig is None:
+            # 文件缺失 (或已删除)：不缓存 corpus，返回 None。
             self._corpora[corpus_type] = None
             return None
+
+        # 首次加载或签名变化 -> 重建 corpus 及其内存索引。
         corpus = JsonlCorpus.from_file(path)
-        self._corpora[corpus_type] = corpus
+        self._corpora[corpus_type] = (sig, corpus)
         return corpus
 
     # ---------- 搜索 ----------

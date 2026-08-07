@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Optional
 
 from edr_rag import extract as extract_mod
+from edr_rag.atomic_io import atomic_write_text, write_jsonl
 from edr_rag.parse_html import parse_html_file
 from edr_rag.parse_toc import build_file_to_path_index, parse_hhc
 from edr_rag.schema import (
@@ -352,7 +353,7 @@ def run_ingest(
             )
         )
 
-    # 6. write artifacts
+    # 6. write artifacts (P0-6: 原子写入，避免重建中途失败污染现有产物)
     manifest = Manifest(
         manual_id=manual_id,
         source_chm=str(Path(chm_path).resolve()),
@@ -364,16 +365,12 @@ def run_ingest(
         parser_version="p0",
     )
 
-    (workdir / "manifest.json").write_text(
+    atomic_write_text(
+        workdir / "manifest.json",
         json.dumps(manifest.to_json(), ensure_ascii=False, indent=2),
-        encoding="utf-8",
     )
-    with (workdir / "sections.jsonl").open("w", encoding="utf-8") as f:
-        for s in sections:
-            f.write(json.dumps(s.to_jsonl(), ensure_ascii=False) + "\n")
-    with (workdir / "assets.jsonl").open("w", encoding="utf-8") as f:
-        for a in assets:
-            f.write(json.dumps(a.to_jsonl(), ensure_ascii=False) + "\n")
+    write_jsonl(workdir / "sections.jsonl", sections)
+    write_jsonl(workdir / "assets.jsonl", assets)
 
     return manifest
 

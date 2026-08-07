@@ -340,3 +340,82 @@ def test_action_recall_budget_parameter_is_configurable(tmp_path):
     )
     assert r3 and r3[0]["id"] == "net.configure_19"
 
+
+# ---------- P0-6: 按 mtime/size 失效的 in-process 缓存 + 原子重建 ----------
+
+def test_corpus_cache_hit_preserves_same_object(tmp_path):
+    """文件未变化时，多次 _corpus 调用应命中缓存，返回同一对象 (不重读/不重建)。"""
+    _write_artifacts(tmp_path)
+    svc = RetrievalService(tmp_path)
+    c1 = svc._corpus("sections")
+    c2 = svc._corpus("sections")
+    c3 = svc._corpus("sections")
+    assert c1 is not None
+    assert c1 is c2 is c3, "文件未变时必须命中缓存，返回同一 corpus 实例"
+
+
+def test_corpus_rebuild_on_mtime_size_change(tmp_path):
+    """文件被重建 (mtime/size 变化) 后，下次调用应重载并看到新内容。"""
+    _write_artifacts(tmp_path)
+    svc = RetrievalService(tmp_path)
+    svc._corpus("actions")
+    first = svc._corpus("actions")
+
+    # 追加一个新的动作并原子重建 actions.jsonl
+    (tmp_path / "actions.jsonl").write_text(
+        (tmp_path / "actions.jsonl").read_text(encoding="utf-8")
+        + json.dumps({
+            "action_id": "net.new_action",
+            "product": "EDR",
+            "module": "net",
+            "title": "新增动作项",
+            "status": "candidate",
+            "confidence": 0.5,
+            "risk": "low",
+            "requires_confirmation": False,
+            "preconditions": [],
+            "procedure": [{"order": 1, "action": "click", "target": "新增"}],
+            "success_criteria": [],
+            "recovery": [],
+        }, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    rebuilt = svc._corpus("actions")
+    assert rebuilt is not first, "文件 mtime/size 变化后必须重建 corpus"
+    found = svc.search("新增动作项", corpus_type="actions")
+    assert any(r["id"] == "net.new_action" for r in found)
+
+
+def test_corpus_cache_invalidation_is_per_type(tmp_path):
+    """只破坏一个 corpus，其它 corpus 的缓存不受影响。"""
+    _write_artifacts(tmp_path)
+    svc = RetrievalService(tmp_path)
+    s1 = svc._corpus("sections")
+    a1 = svc._corpus("actions")
+    # 仅重建 actions.jsonl
+    (tmp_path / "actions.jsonl").write_text(
+        json.dumps({"action_id": "only", "title": "唯一"}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    assert svc._corpus("actions") is not a1
+    assert svc._corpus("sections") is s1, "未变化的 corpus 应继续命中缓存"
+
+
+def test_corpus_loaded_after_file_appears(tmp_path):
+    """文件初始缺失 -> None；文件随后出现时，应被加载出来。"""
+    svc = RetrievalService(tmp_path)
+    assert svc._corpus("sections") is None
+    _write_artifacts(tmp_path)
+    assert svc._corpus("sections") is not None
+    assert svc.search("配置代理", corpus_type="sections")
+
+
+def test_corpus_none_when_file_removed(tmp_path):
+    """文件被删除后，缓存中的 corpus 应失效并回到 None。"""
+    _write_artifacts(tmp_path)
+    svc = RetrievalService(tmp_path)
+    assert svc._corpus("sections") is not None
+    (tmp_path / "sections.jsonl").unlink()
+    assert svc._corpus("sections") is None
+

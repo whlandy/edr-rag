@@ -222,24 +222,24 @@ def write_p2_artifacts(
 
     Returns (jsonl_path, yaml_path).
     """
+    from ..atomic_io import atomic_write_text, write_jsonl
     from ..index_manifest import maintain_index
 
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
 
-    # JSONL
+    # P0-6: 原子写入——临时文件 + rename，重建中途失败不污染现有产物。
     jsonl_path = workdir / "actions.jsonl"
-    with jsonl_path.open("w", encoding="utf-8") as f:
-        for e in entries:
-            f.write(json.dumps(e.to_jsonl(), ensure_ascii=False) + "\n")
+    write_jsonl(jsonl_path, entries)
 
     # YAML (manual YAML lines — no external dep)
     yaml_path = workdir / "actions.yaml"
-    with yaml_path.open("w", encoding="utf-8") as f:
-        for e in entries:
-            for line in e.to_yaml_lines():
-                f.write(line + "\n")
-            f.write("---\n")
+    yaml_lines = []
+    for e in entries:
+        yaml_lines.extend(e.to_yaml_lines())
+        yaml_lines.append("---")
+    yaml_text = ("\n".join(yaml_lines) + "\n") if yaml_lines else ""
+    atomic_write_text(yaml_path, yaml_text)
 
     # Metadata
     from datetime import datetime, timezone
@@ -253,7 +253,7 @@ def write_p2_artifacts(
         meta["by_status"][e.status] = meta["by_status"].get(e.status, 0) + 1
         meta["by_risk"][e.risk] = meta["by_risk"].get(e.risk, 0) + 1
     meta_path = workdir / "p2_metadata.json"
-    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_text(meta_path, json.dumps(meta, ensure_ascii=False, indent=2))
 
     # P0-5: maintain index manifest for the p2 chain.
     maintain_index(
