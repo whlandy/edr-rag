@@ -145,6 +145,26 @@ def _cli_planner_retrieve(args: argparse.Namespace):
         print("  No results found.")
 
 
+def _cli_answer(args: argparse.Namespace):
+    from .api import EdrRagAPI
+    from .synthesize import answer_to_text
+
+    api = EdrRagAPI(args.workdir)
+    result = api.synthesize(
+        args.query, limit=args.limit, strategy=args.strategy
+    )
+    if args.json:
+        import json as _json
+        print(_json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    # result 是 dict，转回 SynthesizedAnswer 用于文本渲染
+    from .synthesize import SynthesizedAnswer
+    print(answer_to_text(SynthesizedAnswer(**result)))
+    print()
+    print(f"[generated_by={result['generated_by']} confidence={result['confidence']} "
+          f"requires_confirmation={str(result['requires_confirmation']).lower()}]")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="P2: action catalog and planner retrieval CLI",
@@ -198,6 +218,20 @@ def main():
                                 choices=["keyword", "bm25", "vector", "hybrid"],
                                 help="Retrieval strategy threaded to every tier (default: keyword)")
 
+    # answer (P2-1) — structured answer synthesizer
+    answer_parser = subparsers.add_parser(
+        "answer",
+        help="Generate a structured answer from retrieval context (P2-1)",
+    )
+    answer_parser.add_argument("--query", required=True, help="User request / question")
+    answer_parser.add_argument("--workdir", required=True, help="Work directory")
+    answer_parser.add_argument("--limit", type=int, default=5, help="Retrieval limit per tier")
+    answer_parser.add_argument("--strategy", default="keyword",
+                               choices=["keyword", "bm25", "vector", "hybrid"],
+                               help="Retrieval strategy (default: keyword)")
+    answer_parser.add_argument("--json", action="store_true",
+                               help="Emit the full structured answer as JSON")
+
     args = parser.parse_args()
     if not args.subcommand:
         parser.print_help()
@@ -211,6 +245,8 @@ def main():
         _cli_get_action(args)
     elif args.subcommand == "planner-retrieve":
         _cli_planner_retrieve(args)
+    elif args.subcommand == "answer":
+        _cli_answer(args)
 
 
 if __name__ == "__main__":

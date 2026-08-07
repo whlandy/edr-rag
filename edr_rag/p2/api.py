@@ -20,7 +20,7 @@ CLI, and MCP share one code path.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from ..retrieval import RetrievalService
 
@@ -202,3 +202,64 @@ class EdrRagAPI:
         return self._service.planner_retrieve(
             user_request, limit=limit, strategy=strategy, rerank=rerank
         )
+
+    # ---------- 结构化答案合成 (P2-1) ----------
+
+    def synthesize(
+        self,
+        user_request: str,
+        context: Optional[dict] = None,
+        llm: Optional[Callable] = None,
+        limit: int = 5,
+        strategy: str = "keyword",
+    ) -> dict:
+        """基于检索上下文生成结构化答案（P2-1）。
+
+        Args:
+            user_request: 用户请求原文。
+            context: 可选检索上下文 dict（planner_retrieve 形状）。为 None 时
+                内部自动调用 planner_retrieve 获取。
+            llm: 可选的可调用对象 `(user_request, context_text) -> str`，
+                用于生成自然语言 answer；缺省回落为结构化组装（主链路不报错）。
+            limit / strategy: 自动检索时的检索参数。
+
+        Returns:
+            SynthesizedAnswer.to_jsonl() 的 dict:
+            {answer, steps, warnings, preconditions, citations, confidence,
+             requires_confirmation, generated_by}。
+        """
+        from .synthesize import synthesize_answer
+
+        if context is None:
+            context = self._service.planner_retrieve(
+                user_request, limit=limit, strategy=strategy
+            )
+        # 检索返回的动作结果是薄形状（无 procedure/preconditions/recovery），
+        # 用全量动作记录补全，让合成器能输出完整步骤/前置条件/注意事项。
+        context = _enrich_action_details(self._service, context)
+        return synthesize_answer(user_request, context, llm=llm).to_jsonl()
+
+
+def _enrich_action_details(service, context: dict) -> dict:
+    """把薄形状的动作检索结果补全为全量动作记录。
+
+    检索层 (_record_to_action_result) 只返回 id/title/risk/status/confidence/score，
+    丢失了 procedure/preconditions/recovery/requires_confirmation 等结构化字段。
+    这里通过 service.get 逐条取回全量记录，供答案合成器提取完整步骤。
+    """
+    ctx = dict(context)
+    actions = ctx.get("actions") or []
+    enriched = []
+    for a in actions:
+        full = service.get("actions", a.get("id") or a.get("action_id", ""))
+        if full:
+            # 保留检索层的 score 与薄字段，合并全量字段。
+            merged = dict(a)
+            for k, v in full.items():
+                if k not in merged or merged.get(k) in (None, "", 0.0, []):
+                    merged[k] = v
+            enriched.append(merged)
+        else:
+            enriched.append(a)
+    ctx["actions"] = enriched
+    return ctx
