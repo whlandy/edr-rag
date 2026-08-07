@@ -50,10 +50,15 @@ class EdrRagAPI:
         risk_filter: Optional[str] = None,
         status_filter: Optional[str] = None,
         strategy: str = "keyword",
+        recall_budget: int = 4,
     ) -> list[dict]:
         """Search the action catalog (delegated to RetrievalService).
 
         strategy: 'keyword' | 'bm25' | 'vector' | 'hybrid' (default 'keyword').
+
+        recall_budget (P0-4): 召回预算倍数。先按 top_k*recall_budget 扩大
+        候选池打分排序，再对候选池做 risk/status metadata 过滤，结果不足时
+        循环扩大候选池直到满足或耗尽语料；避免严格过滤器导致漏召回。
         """
         filters = {}
         if risk_filter:
@@ -66,6 +71,7 @@ class EdrRagAPI:
             strategy=strategy,
             filters=filters,
             top_k=limit,
+            recall_budget=recall_budget,
         )
 
     def get_action(self, action_id: str) -> Optional[dict]:

@@ -239,3 +239,104 @@ def test_edr_rag_api_accepts_strategy(tmp_path):
         api.action_search("配置代理", strategy="fuzzy")
     with pytest.raises(ValueError):
         api.planner_retrieve("配置代理", strategy="fuzzy")
+
+
+# ---------- P0-4: action metadata filter moved to retrieval stage + recall budget ----------
+
+def _write_budget_fixture(root: Path, n: int = 12, approved_idx: int = -1):
+    """写入 n 个动作，全部匹配 query「配置」，仅 approved_idx 一个为 approved。
+
+    用于构造「严格过滤器 + 候选池不足」回归场景：高排名动作全部是
+    needs_review，唯一 approved 的动作排在评分末尾。
+    """
+    actions = []
+    for i in range(n):
+        actions.append({
+            "action_id": f"net.configure_{i}",
+            "product": "EDR",
+            "module": "net",
+            "title": f"配置代理服务器 {i}",
+            "status": "approved" if i == approved_idx else "needs_review",
+            "confidence": 0.9,
+            "risk": "medium" if i == approved_idx else "high",
+            "requires_confirmation": True,
+            "preconditions": [],
+            "procedure": [{"order": 1, "action": "click", "target": "配置"}],
+            "success_criteria": [],
+            "recovery": [],
+        })
+    (root / "actions.jsonl").write_text(
+        "\n".join(json.dumps(a, ensure_ascii=False) for a in actions) + "\n",
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize("strategy", ["keyword", "bm25", "vector"])
+def test_action_strict_filter_recalls_beyond_budget(tmp_path, strategy):
+    # 20 actions; only the lowest-ranked one (idx 19) is approved.
+    # Initial budget = top_k*recall_budget = 3*4 = 12 < 20, so the LOOP is
+    # what expands the candidate pool and recalls the approved action.
+    # (Old code capped at top_k, or at a fixed 4x=12 budget -> filtered = 0.)
+    _write_budget_fixture(tmp_path, n=20, approved_idx=19)
+    svc = RetrievalService(tmp_path)
+
+    # Strict status filter that only the lowest-ranked action satisfies.
+    results = svc.search(
+        "配置", corpus_type="actions", strategy=strategy,
+        filters={"status": "approved"}, top_k=3,
+    )
+    assert len(results) == 1, f"{strategy}: strict filter must still recall the approved action"
+    assert results[0]["id"] == "net.configure_19"
+    assert results[0]["status"] == "approved"
+
+
+def test_action_strict_filter_exhausts_without_infinite_loop(tmp_path):
+    # Approved action exists but request top_k larger than matches -> returns
+    # whatever matches, no infinite loop, and stops at corpus exhaustion.
+    _write_budget_fixture(tmp_path, n=8, approved_idx=5)
+    svc = RetrievalService(tmp_path)
+    results = svc.search(
+        "配置", corpus_type="actions", strategy="keyword",
+        filters={"status": "approved"}, top_k=10,
+    )
+    # only one approved exists even though top_k=10
+    assert len(results) == 1
+    assert results[0]["id"] == "net.configure_5"
+
+
+def test_action_no_filter_unchanged_by_recall_budget(tmp_path):
+    # Without filters, recall_budget must NOT change the returned count / order.
+    _write_budget_fixture(tmp_path, n=12, approved_idx=11)
+    svc = RetrievalService(tmp_path)
+    plain = svc.search("配置", corpus_type="actions", strategy="keyword", top_k=3)
+    assert len(plain) == 3
+    # top-3 scored actions, all needs_review -> none approved
+    assert all(r["status"] == "needs_review" for r in plain)
+
+
+def test_action_recall_budget_parameter_is_configurable(tmp_path):
+    # recall_budget must be accepted end-to-end via both service and API.
+    from edr_rag.p2.api import EdrRagAPI
+    _write_budget_fixture(tmp_path, n=20, approved_idx=19)
+    svc = RetrievalService(tmp_path)
+    # service level
+    r1 = svc.search(
+        "配置", corpus_type="actions", strategy="keyword",
+        filters={"status": "approved"}, top_k=3, recall_budget=1,
+    )
+    # recall_budget=1 -> initial budget=3, loop expands to 6->12->20
+    assert r1[0]["id"] == "net.configure_19"
+    # API level threads recall_budget through
+    api = EdrRagAPI(tmp_path)
+    r2 = api.action_search(
+        "配置", limit=3, status_filter="approved", strategy="keyword",
+        recall_budget=4,
+    )
+    assert r2 and r2[0]["id"] == "net.configure_19"
+    # recall_budget clamped to >=1, never crashes
+    r3 = api.action_search(
+        "配置", limit=3, status_filter="approved", strategy="keyword",
+        recall_budget=0,
+    )
+    assert r3 and r3[0]["id"] == "net.configure_19"
+

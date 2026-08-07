@@ -26,6 +26,8 @@ planner_retrieve 保持既有的 action -> procedure -> manual 优先级，
 
 from __future__ import annotations
 
+import logging
+import math
 from pathlib import Path
 from typing import Any, Optional
 
@@ -90,6 +92,7 @@ class RetrievalService:
         strategy: str = _DEFAULT_STRATEGY,
         filters: Optional[dict[str, Any]] = None,
         top_k: int = 5,
+        recall_budget: int = 4,
     ) -> list[dict]:
         """统一检索入口。
 
@@ -103,6 +106,10 @@ class RetrievalService:
                 - 'status': 动作过滤 (candidate/needs_review/approved/published)
                 - 'id':     精确匹配 id（actions 用 action_id）做获取式查询
             top_k: 返回条数上限。
+            recall_budget: 动作检索的召回预算倍数 (P0-4)。先扩大候选池
+                (top_k * recall_budget) 打分排序，再对候选池做 metadata
+                过滤；结果不足时循环扩大候选池直到满足或耗尽语料。该倍数
+                只影响候选池大小，不改变最终返回条数 (仍 ≤ top_k)。
 
         Returns:
             结果 dict 列表。actions 返回富字段
@@ -112,6 +119,7 @@ class RetrievalService:
         """
         filters = filters or {}
         top_k = max(int(top_k), 0)
+        recall_budget = max(int(recall_budget), 1)
 
         # 精确 id 获取模式：不做全文打分，直接按主键取。
         if filters.get("id") is not None:
@@ -132,7 +140,11 @@ class RetrievalService:
 
         if corpus_type == "actions":
             results = self._search_actions(
-                query, strategy=strategy, filters=filters, top_k=top_k
+                query,
+                strategy=strategy,
+                filters=filters,
+                top_k=top_k,
+                recall_budget=recall_budget,
             )
         else:
             corpus = self._corpus(corpus_type)
@@ -162,25 +174,111 @@ class RetrievalService:
         strategy: str,
         filters: dict[str, Any],
         top_k: int,
+        recall_budget: int = 4,
     ) -> list[dict]:
         """动作目录检索，输出富字段结果。
 
+        P0-4 召回预算逻辑:
+          先按扩大后的候选预算 (top_k * recall_budget) 打分排序，再对候选
+          池应用 metadata 过滤 (risk/status)，避免「在打分循环内过滤」导致
+          结果不足或漏召回。若过滤后条数仍不足 top_k，且候选池尚未覆盖整个
+          语料，则循环倍增预算继续打分补召回，直到满足或耗尽语料为止。
+
         keyword 策略对 title/action_id 加权，与历史 EdrRagAPI.action_search
-        行为保持一致；过滤 (risk/status) 在打分后应用。
+        行为保持一致。
         """
         corpus = self._corpus("actions")
         if corpus is None:
             return []
+        total = len(corpus.records)
+        budget = max(top_k * recall_budget, top_k)
 
+        while True:
+            scored = self._score_actions(corpus, query, strategy, budget)
+            filtered = _apply_filter(scored, filters, action_shape=True)
+            if len(filtered) >= top_k or budget >= total:
+                break
+            budget = min(total, max(budget * 2, budget + 1))
+
+        return filtered[:top_k]
+
+    def _score_actions(
+        self,
+        corpus: JsonlCorpus,
+        query: str,
+        strategy: str,
+        budget: int,
+    ) -> list[dict]:
+        """对语料打分排序，返回前 `budget` 个命中的动作富字段结果。
+
+        bm25/vector 底层通用结果缺少 risk/status，动作的 metadata 过滤
+        (risk/status) 依赖富字段，因此这里统一用动作富字段重打分排序，
+        保证所有策略都能做一致的 metadata 过滤 (P0-4)。
+        """
         if strategy == "bm25":
-            results = corpus.bm25_search(query, limit=top_k * 4)
+            pairs = self._bm25_rank(corpus, query)
         elif strategy == "vector":
-            results = corpus.vector_search(query, limit=top_k * 4)
+            pairs = self._vector_rank(corpus, query)
         else:  # keyword
-            results = self._keyword_actions(corpus, query, top_k)
+            return self._keyword_actions(corpus, query, budget)
+        return [self._action_result(corpus, i, s) for s, i in pairs[:budget]]
 
-        results = _apply_filter(results, filters, action_shape=True)
-        return results[:top_k]
+    def _bm25_rank(self, corpus: JsonlCorpus, query: str) -> list[tuple[float, int]]:
+        """轻量 BM25 打分，返回 (score, doc_idx) 降序列表 (动作富字段用)。"""
+        from .p1.search import tokenize
+
+        q_tokens = set(tokenize(query))
+        if not q_tokens:
+            return []
+        n = len(corpus.records)
+        idf_cache = {}
+        for t in q_tokens:
+            df = corpus._df.get(t, 0)
+            idf_cache[t] = 0.0 if df == 0 else math.log((n - df + 0.5) / (df + 0.5) + 1)
+        scores: dict[int, float] = {}
+        for t in q_tokens:
+            idf = idf_cache[t]
+            if idf == 0:
+                continue
+            for doc_idx, tf in corpus._postings.get(t, []):
+                dl = corpus._doc_len[doc_idx]
+                tf_norm = (
+                    (tf * (1.5 + 1)) / (tf + 1.5 * (1 - 0.75 + 0.75 * (dl / corpus._avgdl)))
+                    if corpus._avgdl
+                    else 0.0
+                )
+                scores[doc_idx] = scores.get(doc_idx, 0.0) + idf * tf_norm
+        ranked = sorted(scores.items(), key=lambda x: -x[1])
+        return [(s, i) for i, s in ranked]
+
+    def _vector_rank(self, corpus: JsonlCorpus, query: str) -> list[tuple[float, int]]:
+        """向量打分 (缺依赖时降级 BM25) 的 (score, doc_idx) 降序列表。
+
+        复用 p1.search 的可选 embedding 助手，保留对可选 RAG extras 的
+        支持；缺依赖时优雅降级到 BM25，主链路始终可用。
+        """
+        from .p1.search import _cached_vec, _cosine, _optional_embedder
+
+        embed_fn = _optional_embedder()
+        if embed_fn is None:
+            return self._bm25_rank(corpus, query)
+        try:
+            q_vec = embed_fn(query)
+            scored: list[tuple[float, int]] = []
+            for i, r in enumerate(corpus.records):
+                vec = _cached_vec(embed_fn, r["_searchable"])
+                if vec is None:
+                    continue
+                score = _cosine(q_vec, vec)
+                if score > 0:
+                    scored.append((score, i))
+            scored.sort(key=lambda x: -x[0])
+            return scored
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "vector_score failed; falling back to BM25", exc_info=True
+            )
+            return self._bm25_rank(corpus, query)
 
     def _keyword_actions(self, corpus: JsonlCorpus, query: str, top_k: int) -> list[dict]:
         """动作专用 keyword 打分：对 action_id/title 加权。"""
