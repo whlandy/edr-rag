@@ -69,6 +69,10 @@ class Procedure:
     steps: list[ProcedureStep] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     recovery: list[str] = field(default_factory=list)
+    # Expected / success outcome and manual version — both optional so old
+    # JSONL artifacts (without these keys) keep loading unchanged.
+    expected_result: str = ""  # success criteria/gains ("预期结果/成功准则")
+    version: str = ""          # product/manual version, when the source carries one
     confidence: float = 0.0
     status: str = "candidate"
 

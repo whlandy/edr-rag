@@ -11,6 +11,13 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=8.0"]
+# Optional RAG stack: enables embedding-based retrieval (vector_search).
+# Absent these, retrieval gracefully falls back to keyword / BM25.
+rag = [
+    "llama-index-embeddings-huggingface>=0.1.0",
+    "sentence-transformers>=2.2.0",
+    "FlagEmbedding>=1.2.0",  # bge-reranker
+]
 
 [project.scripts]
 edr-rag = "edr_rag.cli:main"

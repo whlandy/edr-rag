@@ -113,12 +113,15 @@ class EdrRagAPI:
         scored = []
         for action in actions:
             # Build searchable text
-            searchable = " ".join([
+            searchable = " \n".join([
                 action.get("action_id", ""),
                 action.get("title", ""),
                 action.get("module", ""),
+                action.get("version", "") or "",
                 " ".join(action.get("preconditions", [])),
                 " ".join(s.get("source_instruction", "") for s in action.get("procedure", [])),
+                " ".join(action.get("success_criteria", [])),
+                " ".join(action.get("recovery", [])),
             ])
 
             score = 0.0

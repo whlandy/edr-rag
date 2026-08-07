@@ -62,6 +62,9 @@ PRECONDITION_MARKERS = {"前置条件", "前提条件", "前置", "前提", "准
 # Markers for recovery
 RECOVERY_MARKERS = {"恢复", "还原", "回滚", "如果失败", "如果连接失败", "故障排除", "排错"}
 
+# Markers for expected result / success criteria
+EXPECTED_MARKERS = {"预期结果", "期望结果", "预期效果", "成功准则", "判断标准", "验证方法"}
+
 # Numbered list detection: lines like "1. ...", "1) ...", "Step 1 ...", "步骤1 ..."
 _STEP_RE = re.compile(
     r"^\s*(?:"
@@ -131,8 +134,11 @@ def _extract_target(text: str, verb: str) -> str:
     return rest[:end].strip()
 
 
-def _split_content_blocks(content: str) -> tuple[list[str], list[str], list[str], list[str]]:
-    """Split section content into (steps, warnings, preconditions, recovery).
+def _split_content_blocks(
+    content: str,
+) -> tuple[list[str], list[str], list[str], list[str], list[str]]:
+    """Split section content into (steps, warnings, preconditions, recovery,
+    expected_results).
 
     Handles two content shapes:
       (a) line-oriented: steps on their own lines ("1. 打开网络设置")
@@ -147,6 +153,7 @@ def _split_content_blocks(content: str) -> tuple[list[str], list[str], list[str]
     warnings: list[str] = []
     preconditions: list[str] = []
     recovery: list[str] = []
+    expected_results: list[str] = []
 
     lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
 
@@ -206,6 +213,18 @@ def _split_content_blocks(content: str) -> tuple[list[str], list[str], list[str]
         if matched_meta:
             continue
 
+        # Detect expected-result / success-criteria lines
+        for e in EXPECTED_MARKERS:
+            if e in ln[:12]:
+                current_block = expected_results
+                etext = ln[len(e):].lstrip(" ：:，。")
+                if etext:
+                    expected_results.append(etext)
+                matched_meta = True
+                break
+        if matched_meta:
+            continue
+
         # Detect recovery lines
         for r in RECOVERY_MARKERS:
             if r in ln:
@@ -220,7 +239,7 @@ def _split_content_blocks(content: str) -> tuple[list[str], list[str], list[str]
         if current_block is not None and current_block is not steps:
             current_block.append(ln)
 
-    return steps, warnings, preconditions, recovery
+    return steps, warnings, preconditions, recovery, expected_results
 
 
 # ---------- Procedure building ----------
@@ -263,7 +282,9 @@ def extract_procedures_from_section(
     if not _looks_like_procedure(title, section_path, content):
         return []
 
-    steps_raw, warnings, preconditions, recovery = _split_content_blocks(content)
+    steps_raw, warnings, preconditions, recovery, expected_results = (
+        _split_content_blocks(content)
+    )
 
     # If no steps were found but section is marked as procedure, try to
     # extract steps from unstructured sentence boundaries (naive).
@@ -276,6 +297,15 @@ def extract_procedures_from_section(
         logger.debug("Section %s marked as procedure but no steps found — skipping",
                      section.get("id"))
         return []
+
+    # Entering procedure: expected result / version are optional enrichments.
+    expected_result = "；".join(e for e in expected_results if e)
+    version = (
+        section.get("version")
+        or section.get("metadata", {}).get("version", "")
+        or section.get("metadata", {}).get("manual_version", "")
+        or ""
+    )
 
     procedure_steps = [
         ProcedureStep(
@@ -310,6 +340,8 @@ def extract_procedures_from_section(
         steps=procedure_steps,
         warnings=warnings,
         recovery=recovery,
+        expected_result=expected_result,
+        version=version,
         confidence=confidence,
         status="candidate",
     )
@@ -416,6 +448,9 @@ def build_chunks(
     # Section chunk
     section_text = section.get("content", "")
     if section_text.strip():
+        section_path_sec = section.get("section_path") or []
+        if isinstance(section_path_sec, str):
+            section_path_sec = [section_path_sec]
         chunks.append(
             RetrievalChunk(
                 id=make_chunk_id("section", section_id),
@@ -426,11 +461,35 @@ def build_chunks(
                 metadata={
                     "product": section.get("product", ""),
                     "title": section.get("title", ""),
+                    "module": (
+                        " / ".join(section_path_sec)
+                        if section_path_sec
+                        else section.get("product", "")
+                    ),
+                    "section_path": section_path_sec,
+                    "source_file": rel_file,
                 },
             )
         )
 
     for proc in procedures:
+        # Module / section-path context derived from the source section.
+        # This is folded into retrieval text by JsonlCorpus._normalize so
+        # queries on module + page context can recall the procedure.
+        section_path_ctx = section.get("section_path") or []
+        if isinstance(section_path_ctx, str):
+            section_path_ctx = [section_path_ctx]
+        proc_meta = {
+            "product": proc.product,
+            "title": proc.title,
+            "operation": proc.operation,
+            "status": proc.status,
+            "module": " / ".join(section_path_ctx) if section_path_ctx else proc.product,
+            "section_path": section_path_ctx,
+            "source_file": rel_file,
+            "version": proc.version or "",
+            "expected_result": proc.expected_result or "",
+        }
         # Procedure chunk
         proc_text = _procedure_to_text(proc)
         chunks.append(
@@ -444,15 +503,17 @@ def build_chunks(
                     procedure_id=proc.id,
                     file=rel_file,
                 ),
-                metadata={
-                    "product": proc.product,
-                    "title": proc.title,
-                    "status": proc.status,
-                },
+                metadata=dict(proc_meta),
             )
         )
         # Step chunks
         for step in proc.steps:
+            # A step inherits its parent procedure's context so fine-grained
+            # step search still carries preconditions/warnings/recovery.
+            step_ctx = dict(proc_meta)
+            step_ctx["preconditions"] = proc.preconditions
+            step_ctx["warnings"] = proc.warnings
+            step_ctx["recovery"] = proc.recovery
             chunks.append(
                 RetrievalChunk(
                     id=make_chunk_id(
@@ -467,7 +528,7 @@ def build_chunks(
                         file=rel_file,
                     ),
                     metadata={
-                        "product": proc.product,
+                        **step_ctx,
                         "order": step.order,
                         "action_hint": step.action_hint,
                     },
@@ -478,12 +539,23 @@ def build_chunks(
 
 
 def _procedure_to_text(proc: Procedure) -> str:
-    """Render a procedure as flat searchable text."""
+    """Render a procedure as flat searchable text.
+
+    Folds every searchable facet into one flat string so a query can
+    recall a procedure by its steps, expected result, warnings, recovery,
+    module (operation) or version — not just its title.
+    """
     lines = [proc.title]
+    if proc.operation and proc.operation != proc.title:
+        lines.append("操作: " + proc.operation)
+    if proc.version:
+        lines.append("版本: " + proc.version)
     if proc.preconditions:
         lines.append("前置条件: " + "；".join(proc.preconditions))
     for step in proc.steps:
         lines.append(f"{step.order}. {step.instruction}")
+    if proc.expected_result:
+        lines.append("预期结果: " + proc.expected_result)
     if proc.warnings:
         lines.append("注意: " + "；".join(proc.warnings))
     if proc.recovery:
