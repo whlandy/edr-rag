@@ -27,6 +27,7 @@ from .metrics import (  # noqa: F401
     query_metrics,
     aggregate_metrics,
 )
+from .tune import TuningResult, tune_rrf_weights  # noqa: F401
 
 __all__ = [
     "EvalSet",
@@ -38,4 +39,6 @@ __all__ = [
     "filter_accuracy",
     "query_metrics",
     "aggregate_metrics",
+    "tune_rrf_weights",
+    "TuningResult",
 ]

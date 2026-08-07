@@ -18,6 +18,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from edr_rag.query import normalize_query
+
 logger = logging.getLogger(__name__)
 
 # ---------- Tokenization (CJK-aware) ----------
@@ -29,8 +31,12 @@ _SPLIT_RE = re.compile(r"[^\u4e00-\u9fffA-Za-z0-9_]+")
 
 def tokenize(text: str) -> list[str]:
     """Split text into tokens: keep CJK chars individually (unigram-ish),
-    latin words as whole tokens."""
-    text = text.lower()
+    latin words as whole tokens.
+
+    P1-6: 先做与查询侧一致的 NFKC 规范化（全半角/大小写），保证查询 token
+    与文档 token 对称，全角查询也能命中半角语料。
+    """
+    text = normalize_query(text)
     tokens: list[str] = []
     # Handle latin words + numbers
     for w in _WORD_RE.findall(text):
@@ -160,7 +166,7 @@ class JsonlCorpus:
             ]
         )
 
-        r["_searchable"] = " ".join([title, paths, file, folded_meta, text])
+        r["_searchable"] = normalize_query(" ".join([title, paths, file, folded_meta, text]))
         r["_title"] = title or meta_title
         r["_doc_id"] = r.get("id") or ""
         return r

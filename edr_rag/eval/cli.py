@@ -5,11 +5,13 @@
             [--strategies keyword bm25 hybrid] [--paraphrases]
     python -m edr_rag.eval.cli run --workdir <path> --data <eval.jsonl> --strategy bm25
     python -m edr_rag.eval.cli validate --data <eval.jsonl>
+    python -m edr_rag.eval.cli tune --workdir <path> --data <eval.jsonl> [--metric mrr]
 
 子命令:
   compare   对比多个策略并输出汇总 + 逐查询明细 (推荐入口)。
   run       只跑单个策略，输出汇总。
   validate  仅校验评测集格式/一致性。
+  tune      (P1-6) 在评测集上网格搜索 hybrid 的 RRF 融合权重并输出最优配置。
 """
 
 from __future__ import annotations
@@ -75,6 +77,25 @@ def _cli_validate(args: argparse.Namespace):
     print("corpus 覆盖:", sorted({q.corpus_type for q in evalset.queries}))
 
 
+def _cli_tune(args: argparse.Namespace):
+    """(P1-6) 网格搜索 hybrid 的 RRF 融合权重。"""
+    evalset = _load(args)
+    from .tune import tune_rrf_weights
+
+    result = tune_rrf_weights(args.workdir, evalset, metric=args.metric)
+    if result.candidates_tried == 0:
+        print("评测集为空，跳过权重调节 (返回默认等权)。")
+        return
+    print(f"目标指标: {result.metric}")
+    print(f"候选网格: {result.candidates_tried} 个配置")
+    for cfg, score in sorted(
+        result.scores.items(), key=lambda kv: -kv[1]
+    ):
+        print(f"    {cfg:<22} {score:.4f}")
+    print(f"最优权重: {result.best_weights}  (fusion [keyword, bm25, (vector)])")
+    print(f"最优 {result.metric}: {result.best_score:.4f}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="P1-5: EDR 查询评测 runner (对比 keyword/bm25/hybrid)",
@@ -101,6 +122,13 @@ def main():
     p_val = sub.add_parser("validate", help="校验评测集")
     p_val.add_argument("--data", required=True)
     p_val.set_defaults(func=_cli_validate)
+
+    p_tune = sub.add_parser("tune", help="(P1-6) 网格搜索 RRF 融合权重")
+    p_tune.add_argument("--workdir", required=True)
+    p_tune.add_argument("--data", required=True)
+    p_tune.add_argument("--metric", default="recall@k",
+                        choices=["recall@k", "mrr", "ndcg@k", "filter_accuracy"])
+    p_tune.set_defaults(func=_cli_tune)
 
     args = parser.parse_args()
     if not args.subcommand:

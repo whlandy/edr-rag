@@ -109,6 +109,21 @@ class RetrievalService:
         # P1-4: 结构化节点缓存（nodes.jsonl），供上下文补全使用；
         # 同样以 (mtime_ns, size) 签名做失效判断。
         self._nodes: tuple[_CacheSig, list[dict]] | None = None
+        # P1-6: hybrid 各路召回的 RRF 融合权重，顺序固定为
+        # [keyword, bm25, vector(如可用)]；None 表示等权。
+        # 由评测集调节 (edr_rag/eval/tune.py) 或直接 set_fusion_weights 设置。
+        self.fusion_weights: list[float] | None = None
+
+    def set_fusion_weights(self, weights: list[float] | None) -> None:
+        """设置 hybrid 的 RRF 融合权重（顺序 keyword/bm25/vector）。
+
+        Args:
+            weights: 非负权重列表，长度 2 或 3（有 vector 时为 3）；
+                None 恢复等权。长度超出实际召回路数时仅取前面可用项。
+        """
+        if weights is not None and any(w < 0 for w in weights):
+            raise ValueError("fusion weights must be non-negative")
+        self.fusion_weights = weights
 
     # ---------- Corpus 懒加载 ----------
 
@@ -155,38 +170,30 @@ class RetrievalService:
         rerank: Optional[bool] = None,
         with_context: bool = False,
         adjacency: int = 1,
+        query_expansion: bool = True,
     ) -> list[dict]:
         """统一检索入口。
 
         Args:
             query: 检索词 (支持中文)。
             corpus_type: 'sections' | 'procedures' | 'actions' | 'chunks'。
-            strategy: 'keyword' | 'bm25' | 'vector' | 'hybrid'；
-                vector 缺依赖时降级 bm25；hybrid 走「多路召回 -> RRF 融合
-                -> (可选) cross-encoder rerank -> top K」(P1-3)。
-            filters: dict，支持:
-                - 'risk':   动作过滤 (low/medium/high)
-                - 'status': 动作过滤 (candidate/needs_review/approved/published)
-                - 'id':     精确匹配 id（actions 用 action_id）做获取式查询
+            strategy: 'keyword' | 'bm25' | 'vector' | 'hybrid'；vector 缺依赖
+                时降级 bm25；hybrid 走「多路召回 -> RRF 融合 -> (可选)
+                cross-encoder rerank -> top K」(P1-3)。
+            filters: dict，支持 'risk'/'status'（动作过滤）与 'id'（精确获取）。
             top_k: 返回条数上限。
-            recall_budget: 动作检索的召回预算倍数 (P0-4)。先扩大候选池
-                (top_k * recall_budget) 打分排序，再对候选池做 metadata
-                过滤；结果不足时循环扩大候选池直到满足或耗尽语料。该倍数
-                只影响候选池大小，不改变最终返回条数 (仍 ≤ top_k)。
-            rerank: cross-encoder 精排开关 (P1-3)。None 表示跟随全局默认
-                (可选依赖可用即启用，否则跳过，见 rerank.RERANK_ENABLED)；
-                True 强制尝试、False 关闭。仅对 hybrid 策略生效。
-            with_context: (P1-4) 是否对结果做「父子节点与相邻步骤上下文补全」。
-                仅对 `corpus_type='nodes'`（结构化节点) 生效并依赖 nodes.jsonl；
-                其余语料类型忽略该开关。开启后每个结果附加 `context` 键
-                （assemble_context 的结构化结果 + 渲染文本）。
-            adjacency: (P1-4) 上下文补全时相邻兄弟的个数（每侧）。
+            recall_budget: 动作检索的召回预算倍数 (P0-4)。
+            rerank: cross-encoder 精排开关 (P1-3)；None 跟随全局默认。
+            with_context: (P1-4) 结构化节点 (nodes) 的上下文补全开关。
+            adjacency: (P1-4) 上下文补全相邻兄弟个数。
+            query_expansion: (P1-6) 是否开启查询侧中文规范化 + 多查询生成。
+                开启（默认）时先 normalize_query，再基于 SYNONYMS 生成多个
+                查询变体做 multi-query 召回并 RRF 融合，提升召回；变体只有
+                一个时行为与关闭完全一致（无额外开销）。关闭则仅规范化。
 
         Returns:
-            结果 dict 列表。actions 返回富字段
-            (id/title/risk/status/confidence/score/snippet)；
-            其余类型返回 JsonlCorpus 的标准结果
-            (id/type/score/title/source/snippet)。
+            结果 dict 列表。actions 返回富字段；其余类型返回 JsonlCorpus
+            标准结果 (id/type/score/title/source/snippet)。
         """
         filters = filters or {}
         top_k = max(int(top_k), 0)
@@ -199,7 +206,6 @@ class RetrievalService:
             if rec is None:
                 return []
             if corpus_type == "actions":
-                # 动作返回统一富字段结果 (id = action_id)。
                 return [self._record_to_action_result(rec)]
             return [dict(rec)]
 
@@ -209,6 +215,54 @@ class RetrievalService:
             )
 
         strategy = self._resolve_strategy(strategy)
+
+        # P1-6: 查询侧规范化 + 多查询生成（query expansion）。
+        from .query import expand_query, normalize_query
+
+        variants = (
+            expand_query(query) if query_expansion else [normalize_query(query)]
+        )
+        if len(variants) <= 1:
+            return self._search_single(
+                variants[0] if variants else query,
+                corpus_type, strategy, filters,
+                top_k, recall_budget, rerank_enabled,
+                with_context, adjacency,
+            )
+        # 多查询：逐变体召回一路，按变体位置降权 RRF 融合，再截断 top_k。
+        variant_weights = [
+            1.0 / (1.0 + 0.3 * i) for i in range(len(variants))
+        ]
+        per_variant: list[list[dict]] = []
+        for v in variants:
+            res = self._search_single(
+                v, corpus_type, strategy, filters,
+                top_k, recall_budget, rerank_enabled,
+                False, adjacency,
+            )
+            if res:
+                per_variant.append(res)
+        if not per_variant:
+            return []
+        fused = rrf_fuse(per_variant, weights=variant_weights)
+        fused = fused[:top_k] if top_k else fused
+        if with_context and corpus_type == "nodes" and fused:
+            fused = self._enrich_with_context(fused, adjacency=adjacency)
+        return fused
+
+    def _search_single(
+        self,
+        query: str,
+        corpus_type: str,
+        strategy: str,
+        filters: dict[str, Any],
+        top_k: int,
+        recall_budget: int,
+        rerank_enabled: bool,
+        with_context: bool,
+        adjacency: int,
+    ) -> list[dict]:
+        """对单个查询执行检索（keyword/bm25/vector/hybrid），供 search 分发。"""
 
         if strategy == "hybrid":
             results = self._search_hybrid(
@@ -353,7 +407,7 @@ class RetrievalService:
 
         if not lists:
             return []
-        fused = rrf_fuse(lists)
+        fused = rrf_fuse(lists, weights=self.fusion_weights)
         fused = _apply_filter(fused, filters)
         reranked, _ = rerank(query, fused, enabled=rerank_enabled)
         return reranked[:top_k]
@@ -413,7 +467,7 @@ class RetrievalService:
 
         if not lists:
             return []
-        return rrf_fuse(lists)
+        return rrf_fuse(lists, weights=self.fusion_weights)
 
     def _score_actions(
         self,

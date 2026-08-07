@@ -43,6 +43,7 @@ def rrf_fuse(
     ranked_lists: list[list[dict]],
     key: str = "id",
     k: float = RRF_K,
+    weights: Optional[list[float]] = None,
 ) -> list[dict]:
     """Reciprocal Rank Fusion 融合多路排序结果。
 
@@ -52,6 +53,10 @@ def rrf_fuse(
         key: 用于去重/合并的主键字段 (generic 语料用 'id'，
             动作富字段结果同样以 'id' = action_id 标识)。
         k: RRF 平滑常数，默认 60。
+        weights: 每路召回的权重（与 ranked_lists 等长，非负）。缺省 None
+            时各路等权（P1-6）。权重由评测集调节（见 edr_rag/eval/tune.py），
+            例如 keyword 召回权重高于 bm25，或 embedding 可用时提高 vector
+            权重。长度不匹配时忽略该参数退回等权。
 
     Returns:
         按 RRF 分数降序的融合结果列表 (去重，每路中各条取最高分)，
@@ -60,17 +65,20 @@ def rrf_fuse(
     if not ranked_lists:
         return []
 
+    if weights is None or len(weights) != len(ranked_lists):
+        weights = [1.0] * len(ranked_lists)
+
     # 每条: id -> rrf score 累加
     scores: dict[str, float] = {}
     first: dict[str, dict] = {}
-    for ranking in ranked_lists:
+    for w, ranking in zip(weights, ranked_lists):
         if not ranking:
             continue
         for rank, item in enumerate(ranking):
             ident = item.get(key)
             if ident is None:
                 continue
-            scores[ident] = scores.get(ident, 0.0) + 1.0 / (k + rank + 1)
+            scores[ident] = scores.get(ident, 0.0) + w / (k + rank + 1)
             if ident not in first:
                 first[ident] = item
 
