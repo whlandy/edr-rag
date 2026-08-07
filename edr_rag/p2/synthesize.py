@@ -1,5 +1,9 @@
 """P2-1 结构化答案合成器 — 输入检索上下文，输出结构化答案。
 
+P2-2 逐条引用来源：答案的每个 steps / warnings / assertions 都携带来源引用
+（source file / section_id / procedure_id），可追溯到 artifacts
+（sections.jsonl / procedures.jsonl / actions.jsonl）。
+
 设计 (§6, Answer Synthesis):
   检索(planner_retrieve / action_search / procedure_search)返回结构化上下文后，
   需要把它组织成最终呈递给用户/规划器的答案。本模块负责「答案生成」：
@@ -9,11 +13,19 @@
 输出结构化结果（SynthesizedAnswer.to_jsonl()）:
   - answer:               自然语言回答。LLM 可用时由 LLM 生成；否则由结构化
                           字段组装（保证无 LLM 时主链路仍可用且可读）。
-  - steps:                list[dict] 操作步骤（order/action/target/instruction）。
-  - warnings:             list[str] 注意事项（含动作级别的 recovery/风险提示）。
+  - steps:                list[dict] 操作步骤（order/action/target/instruction/
+                          来源引用 source）。每个 step 携带 source（file/
+                          section_id/procedure_id/action_id），可逐条溯源。
+  - warnings:             list[str] 注意事项文本（含动作级别的 recovery/风险提示）。
+                          保留为纯文本以兼容既有调用方与渲染路径。
+  - warning_sources:      list[dict] 与 warnings 一一对应的来源引用（P2-2）：
+                          warning_sources[i] 是 warnings[i] 的来源(file/section_id/
+                          procedure_id/action_id)。
+  - assertions:           list[dict] 断言/成功准则（P2-2），派生自动作的
+                          success_criteria。每条含 text 与 source 引用。
   - preconditions:        list[str] 前置条件。
   - citations:            list[dict] 引用（来源 action/procedure/section id、
-                          title、score），供溯源。
+                          title、score），供整体溯源。
   - confidence:           float 综合置信度。
   - requires_confirmation:bool 是否需要人工确认。
 
@@ -27,7 +39,7 @@ LLM 可选（设计要点）:
 输入 context 兼容两种形状（向前兼容现有检索入口）:
   1. planner_retrieve 的 dict:  {query, actions:[...], procedures:[...], sections:[...]}
   2. 动作检索 / 流程检索的 list[dict]（自动归一化为上下文）:
-     - actions 走富字段(id/title/risk/status/confidence/preconditions/procedure)
+     - actions 走富字段(id/title/risk/status/confidence/preconditions/procedure/source)
      - procedures 走检索结果 dict
 """
 
@@ -43,16 +55,23 @@ LLM_MODE = "llm"
 
 @dataclass
 class SynthesizedAnswer:
-    """结构化答案（P2-1）。
+    """结构化答案（P2-1，P2-2 逐条引用来源）。
 
     `answer` 为全文；`steps`/`warnings`/`preconditions`/`citations` 为结构化
     字段；`confidence` 与 `requires_confirmation` 汇总给规划器用于决策。
     `generated_by` 记录 answer 是 LLM 生成还是组装（assemble），便于审计。
+
+    P2-2 溯源字段:
+      - 每个 `steps[i]` 含 `source`（file/section_id/procedure_id/action_id）。
+      - `warning_sources[i]` 对应 `warnings[i]` 的来源。
+      - `assertions` 为断言/成功准则，每条含 `text` 与 `source`。
     """
 
     answer: str
     steps: list[dict] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    warning_sources: list[dict] = field(default_factory=list)
+    assertions: list[dict] = field(default_factory=list)
     preconditions: list[str] = field(default_factory=list)
     citations: list[dict] = field(default_factory=list)
     confidence: float = 0.0
@@ -97,12 +116,47 @@ def _normalize_context(context: Any) -> dict:
 # ---------- 结构化字段提取 ----------
 
 
+def _resolve_source(action: dict, *, kind: str = "action") -> dict:
+    """从动作/流程/章节记录中解析来源引用（P2-2）。
+
+    兼容多种形状:
+      - 动作富字段:     action["source"] = {manual_id, procedure_id, file}
+      - 流程记录:       proc["source"]  = {file, section_id, anchor}
+      - 扁平形状:       action["file"] / action["section_id"] /
+                        action["procedure_id"] / action["source_file"] ...
+
+    Returns:
+        {file, section_id, procedure_id, id} 的引用 dict；字段缺失时为空串。
+    """
+    raw_src = action.get("source")
+    src = raw_src if isinstance(raw_src, dict) else {}
+    ref = {
+        "file": (
+            src.get("file")
+            or action.get("source_file")
+            or action.get("file")
+            or ""
+        ),
+        "section_id": src.get("section_id") or action.get("section_id") or "",
+        "procedure_id": (
+            src.get("procedure_id")
+            or action.get("procedure_id")
+            or (action.get("id", "") if str(action.get("id", "")).startswith("procedure.") else "")
+        ),
+        "id": action.get("id") or action.get("action_id") or "",
+    }
+    # 归一化 None -> ""
+    return {k: (v if v is not None else "") for k, v in ref.items()}
+
+
 def _extract_steps(action: dict) -> list[dict]:
-    """从动作富字段里提取操作步骤。
+    """从动作富字段里提取操作步骤（P2-2 逐条带来源引用）。
 
     优先读富字段的 procedure（ActionStep 字典序）；无 procedure 时尝试
-    从裸 action/action_id 兜底为单步。
+    从裸 action/action_id 兜底为单步。每个 step 附带 `source` 引用
+    （file/section_id/procedure_id/action_id），可追溯到 artifacts。
     """
+    source = _resolve_source(action)
     steps: list[dict] = []
     for s in action.get("procedure") or []:
         if isinstance(s, dict):
@@ -111,6 +165,7 @@ def _extract_steps(action: dict) -> list[dict]:
                 "action": s.get("action", ""),
                 "target": s.get("target", ""),
                 "instruction": s.get("source_instruction", ""),
+                "source": dict(source),
             })
     if not steps:
         # 兜底：没有 procedure 时，把动作本身作为一步说明。
@@ -121,17 +176,24 @@ def _extract_steps(action: dict) -> list[dict]:
                 "action": action.get("action", ""),
                 "target": "",
                 "instruction": title,
+                "source": dict(source),
             })
     return steps
 
 
-def _extract_warnings(action: dict) -> list[str]:
-    """从动作富字段 + 步骤说明里收集注意事项。
+def _extract_warnings(action: dict) -> tuple[list[str], list[dict]]:
+    """从动作富字段 + 步骤说明里收集注意事项（P2-2 逐条带来源）。
 
     读 action 的 recovery（恢复/回滚说明）与 risk 提示，并补充
     requires_confirmation 的确认提示。去重保序，避免重复项。
+
+    Returns:
+        (warnings, sources)：warnings 为纯文本列表；sources 与之一一对应，
+        每条为 _resolve_source 来源引用。
     """
+    source = _resolve_source(action)
     warnings: list[str] = []
+    sources: list[dict] = []
     seen: set[str] = set()
 
     def _add(text: str) -> None:
@@ -139,6 +201,7 @@ def _extract_warnings(action: dict) -> list[str]:
         if text and text not in seen:
             seen.add(text)
             warnings.append(text)
+            sources.append(dict(source))
 
     for r in action.get("recovery") or []:
         _add(r)
@@ -152,7 +215,23 @@ def _extract_warnings(action: dict) -> list[str]:
     if action.get("requires_confirmation") or action.get("status") == "needs_review":
         _add("该操作需要人工确认后方可执行（requires_confirmation）。")
 
-    return warnings
+    return warnings, sources
+
+
+def _extract_assertions(action: dict) -> list[dict]:
+    """从动作的成功准则（success_criteria）提取断言（P2-2）。
+
+    每条断言含 text 与 source 引用，作为答案的可验证断言，逐条可溯源。
+    """
+    source = _resolve_source(action)
+    assertions: list[dict] = []
+    seen: set[str] = set()
+    for sc in action.get("success_criteria") or []:
+        text = str(sc).strip()
+        if text and text not in seen:
+            seen.add(text)
+            assertions.append({"text": text, "source": dict(source)})
+    return assertions
 
 
 def _extract_preconditions(action: dict) -> list[str]:
@@ -290,13 +369,19 @@ def synthesize_answer(
     primary = actions or ctx.get("procedures") or []
 
     steps: list[dict] = []
+    # warnings 与 warning_sources 并行；_extract_warnings 返回 (texts, sources)。
     warnings: list[str] = []
+    warning_sources: list[dict] = []
+    assertions: list[dict] = []
     preconditions: list[str] = []
     for a in actions:
         steps.extend(_extract_steps(a))
-        warnings.extend(_extract_warnings(a))
+        a_warnings, a_sources = _extract_warnings(a)
+        warnings.extend(a_warnings)
+        warning_sources.extend(a_sources)
+        assertions.extend(_extract_assertions(a))
         preconditions.extend(_extract_preconditions(a))
-    # 去重（按内容）
+    # 去重（按内容）；warnings 与 warning_sources 同步去重，保证一一对应
     unique_steps: list[dict] = []
     seen_steps: set[tuple] = set()
     for s in steps:
@@ -306,9 +391,24 @@ def synthesize_answer(
         seen_steps.add(key)
         unique_steps.append(s)
     seen_w: set[str] = set()
-    uniq_warnings = [w for w in warnings if not (w in seen_w or seen_w.add(w))]
+    uniq_warnings: list[str] = []
+    uniq_warning_sources: list[dict] = []
+    for w, src in zip(warnings, warning_sources):
+        if w in seen_w:
+            continue
+        seen_w.add(w)
+        uniq_warnings.append(w)
+        uniq_warning_sources.append(src)
     seen_p: set[str] = set()
     uniq_pre = [p for p in preconditions if not (p in seen_p or seen_p.add(p))]
+    # 断言去重（按 text）
+    uniq_assertions: list[dict] = []
+    seen_a: set[str] = set()
+    for a in assertions:
+        if a["text"] in seen_a:
+            continue
+        seen_a.add(a["text"])
+        uniq_assertions.append(a)
 
     citations = _extract_citations(ctx)
     confidence = _compute_confidence(ctx)
@@ -336,6 +436,8 @@ def synthesize_answer(
         answer=answer,
         steps=unique_steps,
         warnings=uniq_warnings,
+        warning_sources=uniq_warning_sources,
+        assertions=uniq_assertions,
         preconditions=uniq_pre,
         citations=citations,
         confidence=confidence,
@@ -369,12 +471,54 @@ def _render_context_text(
     return "\n".join(lines)
 
 
+def _render_source_ref(source: Any) -> str:
+    """把来源引用 dict 渲染成可读短串（P2-2）。
+
+    优先级: file 本身 > file + section_id > file + procedure_id。全部为空则
+    返回空串，调用方决定是否展示。
+    """
+    if not isinstance(source, dict):
+        return ""
+    file = source.get("file") or ""
+    section_id = source.get("section_id") or ""
+    procedure_id = source.get("procedure_id") or ""
+    bits = [b for b in (file, section_id, procedure_id) if b]
+    return "/".join(bits)
+
+
 def answer_to_text(answer: SynthesizedAnswer) -> str:
     """把结构化答案渲染成纯文本（CLI/展示用）。
 
-    输出含 answer 正文 + 引用列表，方便终端呈现与溯源性展示。
+    输出含 answer 正文 + 逐条来源（steps/warnings/assertions）+ 引用列表，
+    方便终端呈现与溯源性展示。
     """
     out = [answer.answer]
+
+    if answer.steps:
+        out.append("")
+        out.append("操作步骤（含来源）：")
+        for s in answer.steps:
+            ref = _render_source_ref(s.get("source"))
+            suffix = f"  [来源: {ref}]" if ref else ""
+            out.append(f"  {s.get('order', 1)}. {s.get('instruction', '')}{suffix}")
+
+    if answer.warnings:
+        out.append("")
+        out.append("注意事项（含来源）：")
+        for i, w in enumerate(answer.warnings):
+            src = answer.warning_sources[i] if i < len(answer.warning_sources) else {}
+            ref = _render_source_ref(src)
+            suffix = f"  [来源: {ref}]" if ref else ""
+            out.append(f"  - {w}{suffix}")
+
+    if answer.assertions:
+        out.append("")
+        out.append("断言/成功准则（含来源）：")
+        for a in answer.assertions:
+            ref = _render_source_ref(a.get("source"))
+            suffix = f"  [来源: {ref}]" if ref else ""
+            out.append(f"  - {a.get('text', '')}{suffix}")
+
     if answer.citations:
         out.append("")
         out.append("引用来源：")

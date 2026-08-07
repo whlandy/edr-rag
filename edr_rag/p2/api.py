@@ -225,8 +225,10 @@ class EdrRagAPI:
 
         Returns:
             SynthesizedAnswer.to_jsonl() 的 dict:
-            {answer, steps, warnings, preconditions, citations, confidence,
-             requires_confirmation, generated_by}。
+            {answer, steps, warnings, warning_sources, assertions, preconditions,
+             citations, confidence, requires_confirmation, generated_by}。
+            P2-2: 每个 step 含 source；warning_sources 与 warnings 一一对应；
+            assertions 为带 source 的断言列表，均可追溯到 artifacts。
         """
         from .synthesize import synthesize_answer
 
