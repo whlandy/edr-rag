@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -64,12 +65,42 @@ class EdrRagAgent:
     implementation that reads P0/P1/P2 artifacts and exposes MCP tools.
     """
 
-    def __init__(self, workdir: str):
+    def __init__(self, workdir: str, trace: Optional[bool] = None):
         self.workdir = Path(workdir)
         self.feedback_store = FeedbackStore(str(self.workdir / "feedback.jsonl"))
         # Unified retrieval entry (P0-2) — the only way to access JSONL artifacts.
         from edr_rag.retrieval import RetrievalService
         self.retrieval = RetrievalService(self.workdir)
+        # P3-2: 结构化可观测性 —— 默认开启 JSONL 追踪 (trace.jsonl)。
+        # trace=False 或环境变量 EDR_RAG_TRACE=0 时关闭，保证可独立于观测运行。
+        from edr_rag.p3.tracing import EventTracer
+        if trace is None:
+            trace = os.environ.get("EDR_RAG_TRACE", "1") not in ("0", "false", "False")
+        self.trace_enabled = bool(trace)
+        self.tracer = (
+            EventTracer(self.workdir / "trace.jsonl") if self.trace_enabled else None
+        )
+
+    # P3-2: 统一检索追踪辅助 —— 计时 + 记录检索事件，返回 (结果, 耗时ms)。
+    def _traced_search(self, ctx, corpus_type, query, limit, strategy, rerank):
+        from edr_rag.p3.tracing import TraceContext
+        t0 = time.perf_counter()
+        try:
+            results = self.retrieval.search(
+                query, corpus_type=corpus_type, top_k=limit,
+                strategy=strategy, rerank=rerank,
+            )
+        except Exception:  # 记录失败事件后重新抛出，主链路异常语义不变
+            latency = (time.perf_counter() - t0) * 1000.0
+            if self.tracer is not None and ctx is None:
+                TraceContext(self.tracer, context=f"{corpus_type}.search").record_retrieval(
+                    query, corpus_type, strategy, latency, [], ok=False,
+                )
+            raise
+        latency = (time.perf_counter() - t0) * 1000.0
+        if ctx is not None:
+            ctx.record_retrieval(query, corpus_type, strategy, latency, results)
+        return results, latency
 
     # ----- Knowledge search tools -----
 
@@ -80,10 +111,10 @@ class EdrRagAgent:
         strategy: 'keyword' | 'bm25' | 'vector' | 'hybrid' (default 'keyword').
         rerank (P1-3): cross-encoder 精排开关，仅对 hybrid 生效。
         """
-        return self.retrieval.search(
-            query, corpus_type="sections", top_k=limit,
-            strategy=strategy, rerank=rerank,
-        )
+        from edr_rag.p3.tracing import TraceContext
+        ctx = TraceContext(self.tracer, context="search_sections") if self.tracer else None
+        results, _ = self._traced_search(ctx, "sections", query, limit, strategy, rerank)
+        return results
 
     def search_procedures(self, query: str, limit: int = 5, strategy: str = "keyword",
                           rerank: Optional[bool] = None) -> list[dict]:
@@ -92,10 +123,10 @@ class EdrRagAgent:
         strategy: 'keyword' | 'bm25' | 'vector' | 'hybrid' (default 'keyword').
         rerank (P1-3): cross-encoder 精排开关，仅对 hybrid 生效。
         """
-        return self.retrieval.search(
-            query, corpus_type="procedures", top_k=limit,
-            strategy=strategy, rerank=rerank,
-        )
+        from edr_rag.p3.tracing import TraceContext
+        ctx = TraceContext(self.tracer, context="search_procedures") if self.tracer else None
+        results, _ = self._traced_search(ctx, "procedures", query, limit, strategy, rerank)
+        return results
 
     def search_actions(self, query: str, limit: int = 5, strategy: str = "keyword",
                        rerank: Optional[bool] = None) -> list[dict]:
@@ -104,10 +135,10 @@ class EdrRagAgent:
         strategy: 'keyword' | 'bm25' | 'vector' | 'hybrid' (default 'keyword').
         rerank (P1-3): cross-encoder 精排开关，仅对 hybrid 生效。
         """
-        return self.retrieval.search(
-            query, corpus_type="actions", top_k=limit,
-            strategy=strategy, rerank=rerank,
-        )
+        from edr_rag.p3.tracing import TraceContext
+        ctx = TraceContext(self.tracer, context="search_actions") if self.tracer else None
+        results, _ = self._traced_search(ctx, "actions", query, limit, strategy, rerank)
+        return results
 
     def search_chunks(self, query: str, limit: int = 5, strategy: str = "keyword",
                       rerank: Optional[bool] = None) -> list[dict]:
@@ -116,10 +147,10 @@ class EdrRagAgent:
         strategy: 'keyword' | 'bm25' | 'vector' | 'hybrid' (default 'keyword').
         rerank (P1-3): cross-encoder 精排开关，仅对 hybrid 生效。
         """
-        return self.retrieval.search(
-            query, corpus_type="chunks", top_k=limit,
-            strategy=strategy, rerank=rerank,
-        )
+        from edr_rag.p3.tracing import TraceContext
+        ctx = TraceContext(self.tracer, context="search_chunks") if self.tracer else None
+        results, _ = self._traced_search(ctx, "chunks", query, limit, strategy, rerank)
+        return results
 
     def get_action(self, action_id: str) -> Optional[dict]:
         """Retrieve a specific action by action_id."""
@@ -147,10 +178,24 @@ class EdrRagAgent:
         from edr_rag.p2.api import EdrRagAPI
 
         api = EdrRagAPI(self.workdir)
-        return api.ask_answer(
-            query, limit=limit, strategy=strategy, min_confidence=min_confidence,
-            confirm=confirm,
-        )
+        from edr_rag.p3.tracing import TraceContext
+
+        ctx = TraceContext(self.tracer, context="ask_answer") if self.tracer else None
+        t0 = time.perf_counter()
+        try:
+            result = api.ask_answer(
+                query, limit=limit, strategy=strategy, min_confidence=min_confidence,
+                confirm=confirm,
+            )
+        except Exception:
+            if ctx is not None:
+                latency = (time.perf_counter() - t0) * 1000.0
+                ctx.record_generation(query, latency, {"answer_status": "error"}, ok=False)
+            raise
+        latency = (time.perf_counter() - t0) * 1000.0
+        if ctx is not None:
+            ctx.record_generation(query, latency, result)
+        return result
 
     # ----- Feedback tools -----
 

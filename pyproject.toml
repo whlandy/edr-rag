@@ -28,6 +28,7 @@ edr-rag = "edr_rag.cli:main"
 edr-rag-p1 = "edr_rag.p1.cli:main"
 edr-rag-p2 = "edr_rag.p2.cli:main"
 edr-rag-mcp = "edr_rag.p3.server:main"
+edr-rag-trace = "edr_rag.p3.trace_cli:main"
 edr-rag-eval = "edr_rag.eval.cli:main"
 
 [build-system]
