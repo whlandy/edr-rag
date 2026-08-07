@@ -150,21 +150,36 @@ def _cli_answer(args: argparse.Namespace):
     from .synthesize import answer_to_text
 
     api = EdrRagAPI(args.workdir)
-    result = api.synthesize(
-        args.query, limit=args.limit, strategy=args.strategy,
-        min_confidence=args.min_confidence,
-    )
+    if args.confirm is not None:
+        # P2-5: 显式确认门控路径。命中 requires_confirmation 的 Action 且未
+        # confirm 时返回门控答案（扣留可执行步骤）。
+        result = api.ask_answer(
+            args.query, limit=args.limit, strategy=args.strategy,
+            min_confidence=args.min_confidence, confirm=args.confirm,
+        )
+    else:
+        result = api.synthesize(
+            args.query, limit=args.limit, strategy=args.strategy,
+            min_confidence=args.min_confidence,
+        )
     if args.json:
         import json as _json
         print(_json.dumps(result, ensure_ascii=False, indent=2))
         return
-    # result 是 dict，转回 SynthesizedAnswer 用于文本渲染
+    # result 是 dict，转回 SynthesizedAnswer 用于文本渲染（过滤掉 agent 便捷
+    # 字段与 P2-5 confirmation 元数据，避免 dataclass 收到未知 kwargs）。
     from .synthesize import SynthesizedAnswer
-    print(answer_to_text(SynthesizedAnswer(**result)))
+    field_names = {f for f in SynthesizedAnswer.__dataclass_fields__}
+    base = {k: v for k, v in result.items() if k in field_names}
+    print(answer_to_text(SynthesizedAnswer(**base)))
     print()
+    if result.get("confirmation_status") == "required":
+        print("[confirmation_status=required] 该答案含需显式确认的高风险 Action，"
+              "可执行步骤已扣留；请确认后以 --confirm 重跑以放行。")
     print(f"[generated_by={result['generated_by']} confidence={result['confidence']} "
           f"requires_confirmation={str(result['requires_confirmation']).lower()} "
           f"answer_status={result['answer_status']} "
+          f"confirmation_status={result.get('confirmation_status', '-')} "
           f"steps={len(result.get('steps') or [])} "
           f"preconditions={len(result.get('preconditions') or [])}]")
 
@@ -237,6 +252,10 @@ def main():
                                help="Emit the full structured answer as JSON")
     answer_parser.add_argument("--min-confidence", type=float, default=None,
                                help="证据不足拒答的置信度阈值 (P2-3, 默认 0.4)")
+    answer_parser.add_argument("--confirm", type=lambda s: s.strip().lower() in ("1", "true", "yes"),
+                               default=None, nargs="?", const=True,
+                               help="P2-5 显式确认高风险 Action：传 --confirm 表示确认放行完整步骤；"
+                                    "不传则命中 requires_confirmation 时返回门控答案。")
 
     args = parser.parse_args()
     if not args.subcommand:

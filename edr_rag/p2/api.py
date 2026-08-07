@@ -250,7 +250,7 @@ class EdrRagAPI:
         ).to_jsonl()
 
 
-    # ---------- AskAnswer: 结构化答案的 agent 消费入口 (P2-4) ----------
+    # ---------- AskAnswer: 结构化答案的 agent 消费入口 (P2-4 / P2-5) ----------
 
     def ask_answer(
         self,
@@ -259,6 +259,7 @@ class EdrRagAPI:
         limit: int = 5,
         strategy: str = "keyword",
         min_confidence: Optional[float] = None,
+        confirm: Optional[bool] = None,
     ) -> dict:
         """AskAnswer：把问题检索并合成为结构化答案，供 agent/规划器消费 (P2-4)。
 
@@ -271,6 +272,14 @@ class EdrRagAPI:
 
         结构化字段（steps/risk/preconditions/warnings/assertions/answer_status 等）
         与 `synthesize` 完全一致，agent 应优先消费这些字段而不仅是 `answer` 文本。
+
+        P2-5 显式确认门控:
+          - confirm=None（默认）：向后兼容的信息模式，返回完整结构化答案（仅带
+            requires_confirmation / dangerous 等标记字段，不做门控）。
+          - confirm=True / False：对该答案应用显式确认门控。当答案命中
+            requires_confirmation 的 Action 且 confirm 非 True 时，返回
+            confirmation_status='required' 的门控答案（扣留可执行步骤，改为
+            请确认提示）；confirm=True 则放行并标注 confirmation_status='confirmed'。
         """
         result = self.synthesize(
             user_request,
@@ -279,7 +288,22 @@ class EdrRagAPI:
             strategy=strategy,
             min_confidence=min_confidence,
         )
-        return _augment_ask_answer(result)
+        result = _augment_ask_answer(result)
+        if confirm is None:
+            # 兼容模式：不门控，仅返回结构化标记（含 confirmation 信息）。
+            from . import confirmation as confirm_mod
+
+            result.setdefault("confirmation_status", (
+                confirm_mod.CONFIRMATION_CONFIRMED
+                if not confirm_mod.needs_explicit_confirmation(result)
+                else confirm_mod.CONFIRMATION_REQUIRED
+            ))
+            result.setdefault("needs_confirmation",
+                              confirm_mod.needs_explicit_confirmation(result))
+            return result
+        from . import confirmation as confirm_mod
+
+        return confirm_mod.gate_answer(result, confirm=bool(confirm))
 
 
 def _augment_ask_answer(result: dict) -> dict:

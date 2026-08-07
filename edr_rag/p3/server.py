@@ -132,18 +132,24 @@ class EdrRagAgent:
     # ----- AskAnswer: 结构化答案 (P2-4) -----
 
     def ask_answer(self, query: str, limit: int = 5, strategy: str = "keyword",
-                   min_confidence: Optional[float] = None) -> dict:
+                   min_confidence: Optional[float] = None,
+                   confirm: Optional[bool] = None) -> dict:
         """AskAnswer：检索并合成为结构化答案，供 agent/规划器消费 (P2-4)。
 
         返回结构化答案 dict（steps/risk/preconditions/warnings/assertions/
         answer_status/confidence/requires_confirmation/dangerous/sources 等），
         让 agent 消费结构化字段而不只是纯文本。缺依赖时自动降级到 keyword。
+
+        P2-5: `confirm` 用于显式确认门控。为 None 时（默认）返回完整带标记的
+        答案；为 True/False 时执行门控，命中 requires_confirmation 的 Action
+        且未确认则扣留可执行步骤（confirmation_status='required'）。
         """
         from edr_rag.p2.api import EdrRagAPI
 
         api = EdrRagAPI(self.workdir)
         return api.ask_answer(
-            query, limit=limit, strategy=strategy, min_confidence=min_confidence
+            query, limit=limit, strategy=strategy, min_confidence=min_confidence,
+            confirm=confirm,
         )
 
     # ----- Feedback tools -----
@@ -372,7 +378,12 @@ def create_mcp_server(workdir: str) -> Server:
                 description=("AskAnswer (P2-4): 检索并合成一个「结构化答案」，返回 steps / "
                              "preconditions / warnings / risk / confidence / answer_status / "
                              "sources 等结构化字段。agent 应消费这些字段而不是纯文本 answer。"
-                             "这是把问题变成可执行计划的首选入口。"),
+                             "这是把问题变成可执行计划的首选入口。\n\n"
+                             "P2-5 显式确认：`confirm` 字段用于显式确认门控。当答案命中 "
+                             "requires_confirmation=true 的高风险 Action（或检测到冲突）且未传 "
+                             "confirm=true 时，本工具会扣留可执行步骤并返回 confirmation_status="
+                             "'required' 的门控答案；你必须先向用户呈现确认请求、得到明确确认后，"
+                             "再以 confirm=true 重新调用以放行完整操作步骤。"),
                 inputSchema={
                     "type": "object",
                     "properties": {
@@ -380,6 +391,14 @@ def create_mcp_server(workdir: str) -> Server:
                         "limit": {"type": "integer", "description": "Retrieval limit per tier", "default": 5},
                         "strategy": _STRATEGY_PROP,
                         "min_confidence": {"type": "number", "description": "证据不足拒答的置信度阈值 (P2-3, 默认 0.4)", "default": None},
+                        "confirm": {
+                            "type": "boolean",
+                            "description": ("P2-5 显式确认：是否确认放行高风险 Action 的完整步骤。"
+                                            "默认 false；当答案带 requires_confirmation=true 的 Action "
+                                            "且 confirm 非 true 时返回门控答案，需用户明确确认后以 "
+                                            "confirm=true 重新调用。"),
+                            "default": False,
+                        },
                     },
                     "required": ["query"],
                 },
@@ -477,6 +496,10 @@ def create_mcp_server(workdir: str) -> Server:
                     limit=arguments.get("limit", 5),
                     strategy=arguments.get("strategy", "keyword"),
                     min_confidence=arguments.get("min_confidence"),
+                    # P2-5: MCP 工具默认未确认（confirm=false），命中高风险的
+                    # requires_confirmation Action 时会返回门控答案；用户显式
+                    # 确认后以 confirm=true 重新调用才放行完整步骤。
+                    confirm=arguments.get("confirm", False),
                 )
             elif name == "capture_feedback":
                 fb_id = agent.capture_feedback(arguments)
