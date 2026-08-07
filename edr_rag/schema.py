@@ -126,6 +126,10 @@ class AssetRef:
     absolute_path: str  # absolute path on disk
     referenced_by: list[str] = field(default_factory=list)
     description: str | None = None
+    # P3-4: OCR 文本化结果（截图里的文字）。可选，缺 OCR 依赖或识别为空时为
+    # None / ""。写回 assets.jsonl 供检索侧 (ocr.jsonl / corpus_type="images")
+    # 使用；非图片资产恒为 None。
+    ocr_text: str | None = None
 
     def to_jsonl(self) -> dict:
         return asdict(self)

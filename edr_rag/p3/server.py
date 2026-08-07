@@ -152,6 +152,20 @@ class EdrRagAgent:
         results, _ = self._traced_search(ctx, "chunks", query, limit, strategy, rerank)
         return results
 
+    def search_images(self, query: str, limit: int = 5, strategy: str = "keyword",
+                      rerank: Optional[bool] = None) -> list[dict]:
+        """Search P3-4 ocr.jsonl (图片 OCR 文本/截图检索, via RetrievalService).
+
+        依据截图 OCR 出的文字检索，用于「我只记得一张图/截图里写着 XX」的
+        场景，返回命中的图片 asset（含 path / 所属章节）。corpus_type="images"。
+        strategy: 'keyword' | 'bm25' | 'vector' | 'hybrid' (default 'keyword').
+        rerank: cross-encoder 精排开关，仅对 hybrid 生效。
+        """
+        from edr_rag.p3.tracing import TraceContext
+        ctx = TraceContext(self.tracer, context="search_images") if self.tracer else None
+        results, _ = self._traced_search(ctx, "images", query, limit, strategy, rerank)
+        return results
+
     def get_action(self, action_id: str) -> Optional[dict]:
         """Retrieve a specific action by action_id."""
         return self.retrieval.get("actions", action_id, key_field="action_id")
@@ -397,6 +411,20 @@ def create_mcp_server(workdir: str) -> Server:
                 },
             ),
             types.Tool(
+                name="search_images",
+                description="Search P3-4 image OCR text (ocr.jsonl). Use when the user remembers text visible in a screenshot/diagram inside the manual, to locate the image asset (path + owning section).",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Search query (CJK-safe), e.g. text seen in a screenshot"},
+                        "limit": {"type": "integer", "description": "Max results", "default": 5},
+                        "strategy": _STRATEGY_PROP,
+                        "rerank": _RERANK_PROP,
+                    },
+                    "required": ["query"],
+                },
+            ),
+            types.Tool(
                 name="get_action",
                 description="Retrieve a full action definition by action_id. Returns risk, preconditions, steps, success criteria.",
                 inputSchema={
@@ -529,6 +557,8 @@ def create_mcp_server(workdir: str) -> Server:
                 results = agent.search_procedures(arguments["query"], arguments.get("limit", 5), strategy=arguments.get("strategy", "keyword"), rerank=_rerank_arg(arguments.get("rerank")))
             elif name == "search_actions":
                 results = agent.search_actions(arguments["query"], arguments.get("limit", 5), strategy=arguments.get("strategy", "keyword"), rerank=_rerank_arg(arguments.get("rerank")))
+            elif name == "search_images":
+                results = agent.search_images(arguments["query"], arguments.get("limit", 5), strategy=arguments.get("strategy", "keyword"), rerank=_rerank_arg(arguments.get("rerank")))
             elif name == "get_action":
                 result = agent.get_action(arguments["action_id"])
                 results = result if result else {"error": "not found"}

@@ -56,6 +56,7 @@ def _make_asset() -> AssetRef:
         absolute_path="/tmp/manual/images/proxy.png",
         referenced_by=["network/proxy.html"],
         description=None,
+        ocr_text=None,
     )
 
 
@@ -303,6 +304,7 @@ def test_asset_ref_jsonl_keys_stable():
         "absolute_path",
         "referenced_by",
         "description",
+        "ocr_text",
     }
     payload = _make_asset().to_jsonl()
     assert set(payload.keys()) == expected, (

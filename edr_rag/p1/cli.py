@@ -185,6 +185,30 @@ def _cli_build_nodes(args: argparse.Namespace):
             print("     " + (w.text[:60].replace("\n", " ") if w.text else ""))
 
 
+def _cli_ocr(args: argparse.Namespace):
+    """P3-4: 对 assets.jsonl 里的图片资产做 OCR，产出 ocr.jsonl 可检索产物。"""
+    from ..ocr import run_ocr
+
+    workdir = Path(args.workdir)
+    assets = workdir / "assets.jsonl"
+    if not assets.exists():
+        print(f"Error: assets not found at {assets}", file=sys.stderr)
+        print("Run P0 ingestion first: python -m tools.edr_rag.cli ingest ...", file=sys.stderr)
+        sys.exit(1)
+
+    summary = run_ocr(workdir, lang=args.lang, force=args.force)
+    if summary.engine is None:
+        print("[ocr] No OCR engine available (install 'ocr' extras, or tesseract). "
+              "Images were skipped — main pipeline unaffected.")
+    else:
+        print(f"[ocr] engine={summary.engine}")
+    print(f"[ocr] total images={summary.total_images} "
+          f"succeeded={summary.ocr_succeeded} "
+          f"empty/skipped={summary.empty_or_skipped}")
+    if summary.ocr_jsonl:
+        print(f"[ocr] wrote -> {summary.ocr_jsonl}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="P1: procedure extraction and local search CLI",
@@ -240,6 +264,16 @@ def main():
     bn_parser.add_argument("--context", action="store_true",
                            help="Print a context window for the first node as a demo")
 
+    # ocr (P3-4: 图片 OCR/多模态截图检索)
+    ocr_parser = subparsers.add_parser(
+        "ocr",
+        help="OCR image assets in assets.jsonl → ocr.jsonl (searchable image text)",
+    )
+    ocr_parser.add_argument("--workdir", required=True, help="Work directory (same as P0 --workdir)")
+    ocr_parser.add_argument("--lang", default=None, help="Tesseract lang hint, e.g. 'chi_sim+eng' (default: auto)")
+    ocr_parser.add_argument("--force", action="store_true",
+                            help="Re-OCR images that already have ocr_text (default: skip, idempotent)")
+
     args = parser.parse_args()
     if not args.subcommand:
         parser.print_help()
@@ -253,6 +287,8 @@ def main():
         _cli_ingest_llama(args)
     elif args.subcommand == "build-nodes":
         _cli_build_nodes(args)
+    elif args.subcommand == "ocr":
+        _cli_ocr(args)
 
 
 if __name__ == "__main__":

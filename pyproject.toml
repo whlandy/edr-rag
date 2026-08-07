@@ -21,6 +21,18 @@ rag = [
     "llama-index-embeddings-huggingface>=0.1.0",
     "sentence-transformers>=2.2.0",
     "FlagEmbedding>=1.2.0",  # bge-reranker
+    # P3-4 OCR extras 也并入 rag：一键安装全能力。
+    "Pillow>=9.0.0",
+    "pytesseract>=0.3.10",
+]
+# Optional OCR stack (P3-4): 让 CHM 内截图/图片的文字可被识别并检索。
+# 注意 pytesseract 还需系统 tesseract 二进制 + 对应 tessdata (chi_sim/eng);
+# rapidocr-onnxruntime 为纯 Python 兜底（内置中英文，无系统依赖）。
+# 两者都缺时 OCR 优雅降级跳过，主链路不受影响。
+ocr = [
+    "Pillow>=9.0.0",
+    "pytesseract>=0.3.10",
+    "rapidocr-onnxruntime>=1.3.0",
 ]
 
 [project.scripts]

@@ -11,6 +11,7 @@
   - procedures -> procedures.jsonl (P1 流程)
   - actions    -> actions.jsonl    (P2 动作目录，返回富字段)
   - chunks     -> chunks.jsonl     (P1 步骤分片)
+  - images     -> ocr.jsonl        (P3-4 图片 OCR 文本/截图检索)
 
 搜索策略 strategy: 'keyword' | 'bm25' | 'vector' | 'hybrid'
   - keyword: 子串/词元重叠打分，动作对 title/action_id 加权
@@ -45,6 +46,7 @@ _CORPUS_FILES: dict[str, str] = {
     "actions": "actions.jsonl",
     "chunks": "chunks.jsonl",
     "nodes": "nodes.jsonl",  # P1-2 结构化节点（P1-4 上下文补全用）
+    "images": "ocr.jsonl",   # P3-4 图片 OCR 文本（截图文字检索）
 }
 
 _ALLOWED_STRATEGIES = ("keyword", "bm25", "vector", "hybrid")
@@ -106,6 +108,7 @@ class RetrievalService:
             "actions": None,
             "chunks": None,
             "nodes": None,
+            "images": None,
         }
         # P1-4: 结构化节点缓存（nodes.jsonl），供上下文补全使用；
         # 同样以 (mtime_ns, size) 签名做失效判断。
