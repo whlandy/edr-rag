@@ -142,6 +142,48 @@ class EdrRagAPI:
             rerank=rerank,
         )
 
+    # ---------- 结构化节点检索 & 上下文补全 (P1-4) ----------
+
+    def node_search(
+        self,
+        query: str,
+        limit: int = 5,
+        strategy: str = "keyword",
+        with_context: bool = True,
+        adjacency: int = 1,
+    ) -> list[dict]:
+        """检索结构化节点（P1-2），并对命中节点做父子/相邻上下文补全 (P1-4)。
+
+        返回结果中每条含 `context`（assemble_context 结构化结果）与
+        `context_text`（带标签渲染文本）。nodes.jsonl 缺失时退化为普通检索
+        （不报错，无 context 键）。
+        """
+        return self._service.search(
+            query,
+            corpus_type="nodes",
+            strategy=strategy,
+            top_k=limit,
+            with_context=with_context,
+            adjacency=adjacency,
+        )
+
+    def get_context(
+        self,
+        node_id: str,
+        *,
+        adjacency: int = 1,
+        include_section: bool = True,
+    ) -> Optional[dict]:
+        """按节点 id 获取结构化上下文（父子/相邻/前置条件/注意事项/恢复）。
+
+        nodes.jsonl 缺失或 node_id 不存在时返回 None。
+        """
+        return self._service.context_for(
+            node_id,
+            adjacency=adjacency,
+            include_section=include_section,
+        )
+
     # ---------- Planner orchestration ----------
 
     def planner_retrieve(

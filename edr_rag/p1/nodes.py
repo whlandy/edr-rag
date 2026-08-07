@@ -117,7 +117,12 @@ def build_section_node(section: dict) -> Optional[StructuredNode]:
 
 
 def _proc_meta(proc: dict, section_path: list[str]) -> dict[str, Any]:
-    """从 Procedure dict 提取 metadata（含 procedure_id / section_path / module）。"""
+    """从 Procedure dict 提取 metadata（含 procedure_id / section_path / module）。
+
+    P1-4: 同时携带结构化 preconditions / warnings / recovery / expected_result，
+    使下游上下文补全（context completion）无需再回读 procedures.jsonl，
+    即可按字段给出前置条件、注意、恢复、预期结果等上下文。
+    """
     src = proc.get("source") or {}
     if isinstance(src, dict):
         rel_file = src.get("file", "")
@@ -135,6 +140,11 @@ def _proc_meta(proc: dict, section_path: list[str]) -> dict[str, Any]:
         "section_path": list(section_path),
         "source_file": rel_file,
         "version": proc.get("version", ""),
+        # P1-4: 结构化上下文字段（列表若无则保留空列表）
+        "preconditions": list(proc.get("preconditions", []) or []),
+        "warnings": list(proc.get("warnings", []) or []),
+        "recovery": list(proc.get("recovery", []) or []),
+        "expected_result": proc.get("expected_result", ""),
     }
 
 

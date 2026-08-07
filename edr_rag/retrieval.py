@@ -28,6 +28,7 @@ planner_retrieve 保持既有的 action -> procedure -> manual 优先级，
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 from pathlib import Path
@@ -42,6 +43,7 @@ _CORPUS_FILES: dict[str, str] = {
     "procedures": "procedures.jsonl",
     "actions": "actions.jsonl",
     "chunks": "chunks.jsonl",
+    "nodes": "nodes.jsonl",  # P1-2 结构化节点（P1-4 上下文补全用）
 }
 
 _ALLOWED_STRATEGIES = ("keyword", "bm25", "vector", "hybrid")
@@ -63,6 +65,30 @@ def _file_signature(path: Path) -> _CacheSig:
     return (st.st_mtime_ns, st.st_size)
 
 
+def _read_jsonl(path: Path) -> list[dict]:
+    """读取 JSONL 文件为 dict 列表；文件缺失 / 空 / 坏行时安全跳过。"""
+    if not path.exists():
+        return []
+    out: list[dict] = []
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:  # pragma: no cover - defensive
+                    logging.getLogger(__name__).warning(
+                        "skip unparseable line in %s", path
+                    )
+    return out
+
+
+def _node_objects(records: list[dict]):
+    """把 nodes.jsonl 的 dict 记录还原成 StructuredNode 对象列表。"""
+    from .p1.nodes import StructuredNode
+
+    return [StructuredNode.from_json(r) for r in records]
+
+
 class RetrievalService:
     """统一检索服务。
 
@@ -78,7 +104,11 @@ class RetrievalService:
             "procedures": None,
             "actions": None,
             "chunks": None,
+            "nodes": None,
         }
+        # P1-4: 结构化节点缓存（nodes.jsonl），供上下文补全使用；
+        # 同样以 (mtime_ns, size) 签名做失效判断。
+        self._nodes: tuple[_CacheSig, list[dict]] | None = None
 
     # ---------- Corpus 懒加载 ----------
 
@@ -123,6 +153,8 @@ class RetrievalService:
         top_k: int = 5,
         recall_budget: int = 4,
         rerank: Optional[bool] = None,
+        with_context: bool = False,
+        adjacency: int = 1,
     ) -> list[dict]:
         """统一检索入口。
 
@@ -144,6 +176,11 @@ class RetrievalService:
             rerank: cross-encoder 精排开关 (P1-3)。None 表示跟随全局默认
                 (可选依赖可用即启用，否则跳过，见 rerank.RERANK_ENABLED)；
                 True 强制尝试、False 关闭。仅对 hybrid 策略生效。
+            with_context: (P1-4) 是否对结果做「父子节点与相邻步骤上下文补全」。
+                仅对 `corpus_type='nodes'`（结构化节点) 生效并依赖 nodes.jsonl；
+                其余语料类型忽略该开关。开启后每个结果附加 `context` 键
+                （assemble_context 的结构化结果 + 渲染文本）。
+            adjacency: (P1-4) 上下文补全时相邻兄弟的个数（每侧）。
 
         Returns:
             结果 dict 列表。actions 返回富字段
@@ -174,7 +211,7 @@ class RetrievalService:
         strategy = self._resolve_strategy(strategy)
 
         if strategy == "hybrid":
-            return self._search_hybrid(
+            results = self._search_hybrid(
                 query,
                 corpus_type,
                 filters=filters,
@@ -182,6 +219,9 @@ class RetrievalService:
                 recall_budget=recall_budget,
                 rerank_enabled=rerank_enabled,
             )
+            if with_context and corpus_type == "nodes" and results:
+                results = self._enrich_with_context(results, adjacency=adjacency)
+            return results
 
         if corpus_type == "actions":
             results = self._search_actions(
@@ -197,6 +237,10 @@ class RetrievalService:
                 return []
             results = self._search_generic(corpus, query, strategy, top_k)
             results = _apply_filter(results, filters)
+
+        # P1-4: 结构化节点语料的上下文补全（仅 nodes 语料、且 with_context=True）
+        if with_context and corpus_type == "nodes" and results:
+            results = self._enrich_with_context(results, adjacency=adjacency)
 
         return results
 
@@ -544,6 +588,96 @@ class RetrievalService:
                 # 剥掉 JsonlCorpus 注入的内部检索字段，仅返回原始记录。
                 return {k: v for k, v in r.items() if not k.startswith("_")}
         return None
+
+    # ---------- P1-4: 父子节点与相邻步骤上下文补全 ----------
+
+    def _load_nodes(self) -> list[dict]:
+        """懒加载结构化节点（nodes.jsonl），以 (mtime_ns, size) 签名做失效判断。
+
+        文件缺失 / 空时返回 []，主链路不报错（上下文补全可选使用）。
+        """
+        path = self.workdir / "nodes.jsonl"
+        sig = _file_signature(path)
+        if self._nodes is not None and self._nodes[0] == sig:
+            return self._nodes[1]
+        if sig is None:
+            self._nodes = None
+            return []
+        nodes = _read_jsonl(path)
+        self._nodes = (sig, nodes)
+        return nodes
+
+    def context_for(
+        self,
+        node_id: str,
+        *,
+        adjacency: int = 1,
+        include_section: bool = True,
+    ) -> Optional[dict]:
+        """为命中节点组装「父子节点与相邻步骤上下文补全」(P1-4)。
+
+        基于 nodes.jsonl 里 P1-2 的结构化节点关系（parent_id / prev_id /
+        next_id / children），返回包含所属 procedure 的 preconditions /
+        warnings / recovery / expected_result、相邻 steps、祖先 section 的
+        结构化上下文。nodes.jsonl 缺失或 node_id 不存在时返回 None。
+
+        Args:
+            node_id: 命中节点的 id（nodes.jsonl 中的 id，如 node.step.x.s1）。
+            adjacency: 相邻兄弟个数（每侧）。
+            include_section: 是否附带祖先 section。
+
+        Returns:
+            assemble_context 的结构化 dict；缺 nodes.jsonl 或未知 id 时 None。
+        """
+        nodes = self._load_nodes()
+        if not nodes:
+            return None
+        from .p1.context import assemble_context
+
+        snodes = _node_objects(nodes)
+        ctx = assemble_context(
+            node_id, snodes,
+            adjacency=adjacency,
+            include_section=include_section,
+        )
+        # 未知 node_id：assemble_context 返回非抛错的空形状，这里收敛为 None
+        if ctx.get("hit") is None:
+            return None
+        return ctx
+
+    def _enrich_with_context(
+        self,
+        results: list[dict],
+        *,
+        adjacency: int = 1,
+    ) -> list[dict]:
+        """给结构化节点检索结果附加 `context` 键（P1-4 上下文补全）。
+
+        每个结果按 id 命中节点，调用 assemble_context（结构化 dict）并渲染
+        出文本；节点加载失败或某条结果无法命中时，该条结果保持原样。
+        """
+        nodes = self._load_nodes()
+        if not nodes:
+            return results
+        from .p1.context import assemble_context, render_context_text
+
+        snodes = _node_objects(nodes)
+        by_id = {n.id: n for n in snodes}
+
+        enriched = []
+        for r in results:
+            rid = r.get("id", "")
+            if rid in by_id:
+                ctx = assemble_context(
+                    rid, snodes,
+                    adjacency=adjacency,
+                    include_section=True,
+                )
+                r = dict(r)
+                r["context"] = ctx
+                r["context_text"] = render_context_text(ctx)
+            enriched.append(r)
+        return enriched
 
     # ---------- Planner 编排 (action -> procedure -> manual) ----------
 
