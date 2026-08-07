@@ -55,6 +55,14 @@ def _cli_compare(args: argparse.Namespace):
                 else ""
             )
         )
+        # P2-6: 逐查询 generation 维度摘要（生成维度只汇报有标注的指标）。
+        g = row.generation_metrics
+        if g:
+            gsum = " ".join(
+                f"{k}={v:.3f}"
+                for k, v in g.items()
+            )
+            print(f"        gen: {gsum}" + (f" [{row.answer.answer_status}]" if row.answer else ""))
         print(f"        ids: {row.ranked_ids}")
 
 

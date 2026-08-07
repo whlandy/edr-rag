@@ -27,6 +27,14 @@ from .metrics import (  # noqa: F401
     query_metrics,
     aggregate_metrics,
 )
+from .generation import (  # noqa: F401
+    citation_accuracy,
+    high_risk_identify_rate,
+    high_risk_flag_hit,
+    query_generation_metrics,
+    refusal_hit,
+    refusal_rate,
+)
 from .tune import TuningResult, tune_rrf_weights  # noqa: F401
 
 __all__ = [
@@ -39,6 +47,12 @@ __all__ = [
     "filter_accuracy",
     "query_metrics",
     "aggregate_metrics",
+    "citation_accuracy",
+    "refusal_hit",
+    "refusal_rate",
+    "high_risk_flag_hit",
+    "high_risk_identify_rate",
+    "query_generation_metrics",
     "tune_rrf_weights",
     "TuningResult",
 ]

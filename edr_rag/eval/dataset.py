@@ -13,6 +13,12 @@ dict) 两种格式。每条查询 (EvalQuery) 包含:
   filter         可选(dict), metadata 过滤条件 (透传给 RetrievalService)
   filter_expected 可选(list), 过滤后应出现的 id 集合
 
+P2-6 生成 (generation) 维度标注（均为可选，缺省 None 表示该查询不参与对应维度）:
+  expected_refusal 可选(bool), 该查询是否应拒答（证据不足/置信度过低）。
+                    用于评测「拒答率 / 误拒答率」。
+  high_risk        可选(bool), 该查询是否涉及应识别出高风险的操作。
+                    用于评测「高风险识别率」。
+
 runner 默认对 `query` 评测；若 ``use_paraphrases`` 打开则把每条改写也当
 一条独立查询评估 (用于放大评测规模)。
 """
@@ -23,6 +29,27 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
+
+
+def _opt_bool(value: Any) -> Optional[bool]:
+    """把评测标注里的可选布尔字段解析成 True/False/None。
+
+    缺省/空 -> None（表示未标注，不参与对应维度）；显式 0/1/true/false/
+    布尔串 归一化为 bool。无法解析时按 None 处理（宽松，避免加载失败）。
+    """
+    if value is None or value == "" or value == []:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("1", "true", "yes", "y", "on", "是", "应"):
+            return True
+        if v in ("0", "false", "no", "n", "off", "否", "不"):
+            return False
+    return None
 
 
 @dataclass
@@ -37,6 +64,9 @@ class EvalQuery:
     top_k: int = 5
     filter: Optional[dict[str, Any]] = None
     filter_expected: list[str] = field(default_factory=list)
+    # P2-6: 生成 (generation) 维度标注（可选，None 表示不参与该维度）。
+    expected_refusal: Optional[bool] = None
+    high_risk: Optional[bool] = None
 
     @staticmethod
     def from_dict(d: dict) -> "EvalQuery":
@@ -50,6 +80,8 @@ class EvalQuery:
             top_k=int(d.get("top_k", 5) or 5),
             filter=d.get("filter") if d.get("filter") else None,
             filter_expected=list(d.get("filter_expected", []) or []),
+            expected_refusal=_opt_bool(d.get("expected_refusal")),
+            high_risk=_opt_bool(d.get("high_risk")),
         )
 
     def effective_queries(self, use_paraphrases: bool = False) -> list[tuple[str, str]]:
@@ -104,6 +136,10 @@ class EvalSet:
                 errors.append(f"[{q.qid}] top_k must be >= 1")
             if q.filter and q.filter_expected and not isinstance(q.filter, dict):
                 errors.append(f"[{q.qid}] filter must be a dict")
+            if q.expected_refusal is not None and not isinstance(q.expected_refusal, bool):
+                errors.append(f"[{q.qid}] expected_refusal must be a bool")
+            if q.high_risk is not None and not isinstance(q.high_risk, bool):
+                errors.append(f"[{q.qid}] high_risk must be a bool")
         return errors
 
 

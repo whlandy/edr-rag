@@ -13,6 +13,14 @@
 输出:
   - 逐查询明细 (query_metrics + returned ids)，便于审查。
   - 策略级汇总报告 (dict)，含各指标均值。
+
+P2-6 (检索与生成分开评测):
+  runner 在检索之外还驱动生成维度 —— 把检索命中的上下文喂给
+  ``synthesize_answer`` 生成结构化答案，再按 generation 维度算：
+  引用正确率 / 拒答率+误拒答率 / 高风险识别率。因此一份评测同时产出
+  「retrieval 表」(Recall/MRR/nDCG/FilterAcc) 与「generation 表」
+  (引用正确率/拒答率/误拒答率/高风识别率)，不再只看最终答案一句话。
+  生成侧复用与 CLI / MCP 完全一致的答案链，评测行为等同于真实使用。
 """
 
 from __future__ import annotations
@@ -21,8 +29,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from ..p2.synthesize import SynthesizedAnswer, synthesize_answer
 from ..retrieval import RetrievalService
 from .dataset import EvalQuery, EvalSet
+from .generation import (
+    high_risk_identify_rate,
+    query_generation_metrics,
+    refusal_rate,
+)
 from .metrics import aggregate_metrics, query_metrics
 
 DEFAULT_STRATEGIES = ("keyword", "bm25", "hybrid")
@@ -40,6 +54,12 @@ class QueryResult:
     returned: list[dict] = field(default_factory=list)
     filter_returned: list[str] = field(default_factory=list)
     metrics: dict[str, float] = field(default_factory=dict)
+    # P2-6: 生成维度结果。
+    answer: Optional[SynthesizedAnswer] = None
+    generation_metrics: dict[str, float] = field(default_factory=dict)
+    # P2-6: 生成维度标注（透传自 EvalQuery，供汇总时按策略分组）。
+    expected_refusal: Optional[bool] = None
+    high_risk: Optional[bool] = None
 
 
 @dataclass
@@ -56,11 +76,44 @@ class EvalReport:
         return out
 
     def summary(self, keys=("recall@k", "mrr", "ndcg@k", "filter_accuracy")) -> dict[str, dict[str, float]]:
-        """按策略聚合指标，返回 {strategy: {metric: mean}}。"""
+        """按策略聚合 retrieval 维度指标，返回 {strategy: {metric: mean}}。"""
         return {
             strategy: aggregate_metrics([r.metrics for r in rows], keys)
             for strategy, rows in self.by_strategy().items()
         }
+
+    def generation_summary(self) -> dict[str, dict[str, float]]:
+        """按策略聚合 generation 维度指标。
+
+        返回 {strategy: {...}}，其中:
+          - citation_accuracy: 引用正确率（在各查询上的均值）。
+          - refusal_recall:    拒答率（应拒答中被拒答的比例）。
+          - false_refusal:     误拒答率（应作答却被拒答的比例）。
+          - high_risk:         高风险识别率（应识别高风险中被识别出的比例）。
+
+        每个指标只在「有对应标注 / 有样本」的策略上计算；无样本的策略
+        给出 0.0 占位，保证结构完整。
+        """
+        out: dict[str, dict[str, float]] = {}
+        for strategy, rows in self.by_strategy().items():
+            ca = aggregate_metrics(
+                [r.generation_metrics for r in rows],
+                keys=("citation_accuracy",),
+            )
+            rr = refusal_rate(
+                [(r.answer.answer_status if r.answer else "", r.expected_refusal)
+                 for r in rows if r.expected_refusal is not None]
+            )
+            hr = high_risk_identify_rate(
+                [(r.answer, r.high_risk) for r in rows if r.high_risk is not None]
+            )
+            out[strategy] = {
+                "citation_accuracy": ca.get("citation_accuracy", 0.0),
+                "refusal_recall": rr["refusal_recall"],
+                "false_refusal": rr["false_refusal"],
+                "high_risk": hr,
+            }
+        return out
 
 
 def _filter_expected(q: EvalQuery) -> Optional[list[str]]:
@@ -77,6 +130,10 @@ def _run_query(
     ranking 指标 (Recall/MRR/NDCG) 用无过滤检索的 top-K 结果；若该用例带
     metadata filter 与 filter_expected，则额外做一次带过滤检索以计算
     filter_accuracy。
+
+    P2-6: 用主检索命中的上下文驱动生成（``synthesize_answer``），计算
+    generation 维度的引用正确率 / 拒答判定 / 高风险识别，与 retrieval 指标
+    一起落在同一个 QueryResult 里。
     """
     top_k = q.top_k
     # 主检索（无过滤）：用于排序类指标。
@@ -106,6 +163,24 @@ def _run_query(
         filter_expected=q.filter_expected if q.filter is not None and q.filter_expected else None,
         filter_returned=filter_returned,
     )
+
+    # P2-6: 生成维度 —— 基于检索命中的上下文生成结构化答案并计算指标。
+    # 无论是否有命中都调用 synthesize_answer：空上下文时其内置的
+    # 证据不足拒答逻辑会给出 status='refused'，保证「应该拒答」类查询
+    # （如隐私越权）能被正确评估，与 CLI/MCP 行为一致。
+    answer = None
+    generation_metrics: dict[str, float] = {}
+    try:
+        answer = synthesize_answer(q.query, results)
+    except Exception:
+        answer = None
+    generation_metrics = query_generation_metrics(
+        answer,
+        q.relevant,
+        expected_refusal=q.expected_refusal,
+        high_risk=q.high_risk,
+    )
+
     return QueryResult(
         qid=q.qid,
         query=q.query,
@@ -115,6 +190,10 @@ def _run_query(
         returned=results,
         filter_returned=filter_returned,
         metrics=metrics,
+        answer=answer,
+        generation_metrics=generation_metrics,
+        expected_refusal=q.expected_refusal,
+        high_risk=q.high_risk,
     )
 
 
@@ -153,6 +232,8 @@ def run_eval(
                 top_k=q.top_k,
                 filter=q.filter,
                 filter_expected=q.filter_expected,
+                expected_refusal=q.expected_refusal,
+                high_risk=q.high_risk,
             )
             for strategy in strategies:
                 rows.append(_run_query(svc, q_run, strategy))
@@ -160,10 +241,18 @@ def run_eval(
 
 
 def format_summary(report: EvalReport) -> str:
-    """把策略级汇总渲染成可读的多行文本 (中文表头)。"""
+    """把策略级汇总渲染成可读的多行文本 (中文表头)。
+
+    输出两段：retrieval 维度（Recall/MRR/nDCG/FilterAcc）与 generation 维度
+    （引用正确率/拒答率/误拒答率/高风险识别率），分别独立成表（P2-6）。
+    """
     lines = [f"评测集: {report.eval_set.name}"
              f"  (主查询 {len(report.eval_set.queries)} 条, "
              f"变体 {report.eval_set.variant_total} 条)"]
+
+    # --- retrieval 维度 ---
+    lines.append("")
+    lines.append("== Retrieval 维度 ==")
     summary = report.summary()
     metric_labels = {
         "recall@k": "Recall@K",
@@ -176,5 +265,22 @@ def format_summary(report: EvalReport) -> str:
     lines.append("-" * len(header))
     for strategy, metrics in summary.items():
         cells = "".join(f"{metrics.get(m, 0.0):>14.4f}" for m in metric_labels)
+        lines.append(f"{strategy:<10}{cells}")
+
+    # --- generation 维度 ---
+    lines.append("")
+    lines.append("== Generation 维度 ==")
+    gen = report.generation_summary()
+    gen_labels = {
+        "citation_accuracy": "引用正确率",
+        "refusal_recall": "拒答率",
+        "false_refusal": "误拒答率",
+        "high_risk": "高风识别率",
+    }
+    g_header = f"{'策略':<10}" + "".join(f"{gen_labels.get(m, m):>14}" for m in gen_labels)
+    lines.append(g_header)
+    lines.append("-" * len(g_header))
+    for strategy, metrics in gen.items():
+        cells = "".join(f"{metrics.get(m, 0.0):>14.4f}" for m in gen_labels)
         lines.append(f"{strategy:<10}{cells}")
     return "\n".join(lines)
