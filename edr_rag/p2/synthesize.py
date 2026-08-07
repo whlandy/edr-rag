@@ -561,6 +561,7 @@ def synthesize_answer(
     context: Any,
     llm: Optional[Callable[[str, str], str]] = None,
     min_confidence: Optional[float] = None,
+    sanitize: bool = True,
 ) -> SynthesizedAnswer:
     """输入检索上下文，输出结构化答案（P2-1）。
 
@@ -574,6 +575,9 @@ def synthesize_answer(
         min_confidence: 证据不足拒答的置信度阈值（P2-3）。为 None 时使用
             模块默认 CONFIDENCE_REFUSE_THRESHOLD。低于该阈值或证据不足
             时明确拒答（answer_status='refused'），不编造。
+        sanitize: (P3-3) 为 True（默认）时，喂给 LLM 的检索上下文先做
+            注入清洗并包裹在「不可信数据围栏」中（system prompt 隔离），
+            降低恶意文档 prompt injection 风险。组装模式（无 llm）不受影响。
 
     Returns:
         SynthesizedAnswer（结构化结果）。
@@ -647,7 +651,17 @@ def synthesize_answer(
     answer = ""
 
     if llm is not None:
-        context_text = _render_context_text(user_request, primary, steps, uniq_warnings, uniq_pre)
+        if sanitize:
+            # P3-3: 检索上下文先行注入清洗 + system prompt 隔离，
+            # 让文档内容只能待在「不可信数据围栏」里，无法覆盖指令。
+            from ..security import render_isolated_context
+
+            _items = list(primary) + [s for s in steps if isinstance(s, dict)]
+            context_text = render_isolated_context(_items, user_request)
+        else:
+            context_text = _render_context_text(
+                user_request, primary, steps, uniq_warnings, uniq_pre
+            )
         try:
             generated = llm(user_request, context_text)
             if generated and generated.strip():

@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from ..retrieval import RetrievalService
+from ..security import ACLPolicy
 
 
 class EdrRagAPI:
@@ -52,6 +53,7 @@ class EdrRagAPI:
         strategy: str = "keyword",
         recall_budget: int = 4,
         rerank: Optional[bool] = None,
+        acl: Optional["ACLPolicy"] = None,
     ) -> list[dict]:
         """Search the action catalog (delegated to RetrievalService).
 
@@ -63,6 +65,8 @@ class EdrRagAPI:
 
         rerank (P1-3): cross-encoder 精排开关，仅对 hybrid 生效；None 跟随
         全局默认 (可选依赖可用即启用)。
+
+        acl (P3-3): 文档级 ACL 过滤策略；None 表示不过滤。
         """
         filters = {}
         if risk_filter:
@@ -77,6 +81,7 @@ class EdrRagAPI:
             top_k=limit,
             recall_budget=recall_budget,
             rerank=rerank,
+            acl=acl,
         )
 
     def get_action(self, action_id: str) -> Optional[dict]:
@@ -95,6 +100,7 @@ class EdrRagAPI:
         scoring: Optional[str] = None,
         strategy: Optional[str] = None,
         rerank: Optional[bool] = None,
+        acl: Optional[ACLPolicy] = None,
     ) -> list[dict]:
         """Search P1 procedures (fallback if action_search has no results).
 
@@ -103,6 +109,7 @@ class EdrRagAPI:
         `strategy` 为准（保持 backward compatibility）。
 
         rerank (P1-3): cross-encoder 精排开关，仅对 hybrid 生效。
+        acl (P3-3): 文档级 ACL 过滤策略；None 表示不过滤。
         """
         if strategy is None:
             strategy = scoring or "keyword"
@@ -112,6 +119,7 @@ class EdrRagAPI:
             strategy=strategy,
             top_k=limit,
             rerank=rerank,
+            acl=acl,
         )
 
     # ---------- Manual search (last priority) ----------
@@ -123,6 +131,7 @@ class EdrRagAPI:
         scoring: Optional[str] = None,
         strategy: Optional[str] = None,
         rerank: Optional[bool] = None,
+        acl: Optional[ACLPolicy] = None,
     ) -> list[dict]:
         """Search P0 sections (for explanation or troubleshooting only).
 
@@ -131,6 +140,7 @@ class EdrRagAPI:
         `strategy` 为准。
 
         rerank (P1-3): cross-encoder 精排开关，仅对 hybrid 生效。
+        acl (P3-3): 文档级 ACL 过滤策略；None 表示不过滤。
         """
         if strategy is None:
             strategy = scoring or "keyword"
@@ -140,6 +150,7 @@ class EdrRagAPI:
             strategy=strategy,
             top_k=limit,
             rerank=rerank,
+            acl=acl,
         )
 
     # ---------- 结构化节点检索 & 上下文补全 (P1-4) ----------
@@ -192,15 +203,17 @@ class EdrRagAPI:
         limit: int = 5,
         strategy: str = "keyword",
         rerank: Optional[bool] = None,
+        acl: Optional[ACLPolicy] = None,
     ) -> dict:
         """Orchestrate the full planner retrieval flow (action → procedure → manual).
 
         Delegates to RetrievalService.planner_retrieve which preserves the
         §6 priority order and threads `strategy` to each retrieval tier.
-        `rerank` (P1-3) is likewise threaded through.
+        `rerank` (P1-3) is likewise threaded through. `acl` (P3-3) filters
+        each tier's results by document-level device/tenant metadata.
         """
         return self._service.planner_retrieve(
-            user_request, limit=limit, strategy=strategy, rerank=rerank
+            user_request, limit=limit, strategy=strategy, rerank=rerank, acl=acl
         )
 
     # ---------- 结构化答案合成 (P2-1) ----------
@@ -213,6 +226,8 @@ class EdrRagAPI:
         limit: int = 5,
         strategy: str = "keyword",
         min_confidence: Optional[float] = None,
+        acl: Optional[ACLPolicy] = None,
+        sanitize: bool = True,
     ) -> dict:
         """基于检索上下文生成结构化答案（P2-1）。
 
@@ -225,6 +240,10 @@ class EdrRagAPI:
             limit / strategy: 自动检索时的检索参数。
             min_confidence: 证据不足拒答的置信度阈值（P2-3）。为 None 时使用
                 模块默认 CONFIDENCE_REFUSE_THRESHOLD。
+            acl: (P3-3) 文档级 ACL 过滤策略；None 表示不过滤。自动检索时
+                透传给每一层，越权的文档不会进入上下文。
+            sanitize: (P3-3) 是否对喂给 LLM 的检索上下文做注入清洗与
+                system prompt 隔离（默认 True）。组装模式下不影响结构化字段。
 
         Returns:
             SynthesizedAnswer.to_jsonl() 的 dict:
@@ -240,13 +259,17 @@ class EdrRagAPI:
 
         if context is None:
             context = self._service.planner_retrieve(
-                user_request, limit=limit, strategy=strategy
+                user_request, limit=limit, strategy=strategy, acl=acl
             )
         # 检索返回的动作结果是薄形状（无 procedure/preconditions/recovery），
         # 用全量动作记录补全，让合成器能输出完整步骤/前置条件/注意事项。
         context = _enrich_action_details(self._service, context)
         return synthesize_answer(
-            user_request, context, llm=llm, min_confidence=min_confidence
+            user_request,
+            context,
+            llm=llm,
+            min_confidence=min_confidence,
+            sanitize=sanitize,
         ).to_jsonl()
 
 
@@ -260,6 +283,8 @@ class EdrRagAPI:
         strategy: str = "keyword",
         min_confidence: Optional[float] = None,
         confirm: Optional[bool] = None,
+        acl: Optional[ACLPolicy] = None,
+        sanitize: bool = True,
     ) -> dict:
         """AskAnswer：把问题检索并合成为结构化答案，供 agent/规划器消费 (P2-4)。
 
@@ -280,6 +305,10 @@ class EdrRagAPI:
             requires_confirmation 的 Action 且 confirm 非 True 时，返回
             confirmation_status='required' 的门控答案（扣留可执行步骤，改为
             请确认提示）；confirm=True 则放行并标注 confirmation_status='confirmed'。
+
+        acl (P3-3): 文档级 ACL 过滤策略；None 表示不过滤。
+        sanitize (P3-3): 是否对喂给 LLM 的检索上下文做注入清洗与 system
+            prompt 隔离（默认 True）。
         """
         result = self.synthesize(
             user_request,
@@ -287,6 +316,8 @@ class EdrRagAPI:
             limit=limit,
             strategy=strategy,
             min_confidence=min_confidence,
+            acl=acl,
+            sanitize=sanitize,
         )
         result = _augment_ask_answer(result)
         if confirm is None:

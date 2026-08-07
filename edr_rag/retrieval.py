@@ -36,6 +36,7 @@ from typing import Any, Optional
 
 from .p1.search import JsonlCorpus
 from .rerank import rrf_fuse, rerank, RERANK_ENABLED
+from .security import ACLPolicy, acl_allows
 
 # 允许的 corpus_type -> 对应 JSONL 文件名
 _CORPUS_FILES: dict[str, str] = {
@@ -171,6 +172,7 @@ class RetrievalService:
         with_context: bool = False,
         adjacency: int = 1,
         query_expansion: bool = True,
+        acl: Optional[ACLPolicy] = None,
     ) -> list[dict]:
         """统一检索入口。
 
@@ -190,6 +192,9 @@ class RetrievalService:
                 开启（默认）时先 normalize_query，再基于 SYNONYMS 生成多个
                 查询变体做 multi-query 召回并 RRF 融合，提升召回；变体只有
                 一个时行为与关闭完全一致（无额外开销）。关闭则仅规范化。
+            acl: (P3-3) 文档级 ACL 过滤策略 (edr_rag.security.ACLPolicy)。
+                None 或未受限策略时不做过滤（向后兼容主链路）；否则对
+                返回结果按设备/租户 metadata 过滤。
 
         Returns:
             结果 dict 列表。actions 返回富字段；其余类型返回 JsonlCorpus
@@ -205,9 +210,16 @@ class RetrievalService:
             rec = self.get(corpus_type, filters["id"])
             if rec is None:
                 return []
-            if corpus_type == "actions":
-                return [self._record_to_action_result(rec)]
-            return [dict(rec)]
+            result = (
+                self._record_to_action_result(rec)
+                if corpus_type == "actions"
+                else dict(rec)
+            )
+            # P3-3: 精确获取同样受 ACL 约束——越权的主键不得泄露内容。
+            # 在原始 record 上判定（富字段结果已丢失 device/tenant metadata）。
+            if not acl_allows(acl, rec):
+                return []
+            return [result]
 
         if strategy not in _ALLOWED_STRATEGIES:
             raise ValueError(
@@ -223,11 +235,15 @@ class RetrievalService:
             expand_query(query) if query_expansion else [normalize_query(query)]
         )
         if len(variants) <= 1:
-            return self._search_single(
-                variants[0] if variants else query,
-                corpus_type, strategy, filters,
-                top_k, recall_budget, rerank_enabled,
-                with_context, adjacency,
+            return self._filter_acl_corpus(
+                corpus_type,
+                self._search_single(
+                    variants[0] if variants else query,
+                    corpus_type, strategy, filters,
+                    top_k, recall_budget, rerank_enabled,
+                    with_context, adjacency,
+                ),
+                acl,
             )
         # 多查询：逐变体召回一路，按变体位置降权 RRF 融合，再截断 top_k。
         variant_weights = [
@@ -248,7 +264,42 @@ class RetrievalService:
         fused = fused[:top_k] if top_k else fused
         if with_context and corpus_type == "nodes" and fused:
             fused = self._enrich_with_context(fused, adjacency=adjacency)
-        return fused
+        # P3-3: 多查询融合后同样应用文档级 ACL 过滤。
+        return self._filter_acl_corpus(corpus_type, fused, acl)
+
+    def _filter_acl_corpus(
+        self,
+        corpus_type: str,
+        results: list[dict],
+        acl: Optional[ACLPolicy],
+    ) -> list[dict]:
+        """对已生成的检索结果做文档级 ACL 过滤（P3-3）。
+
+        结果形状（thin `_to_result` / 动作富字段）可能已丢失 device/tenant/
+        metadata 字段，因此这里把每个结果解析回它在语料中的**原始记录**，
+        再以原始记录判定 ACL，保证对 actions/sections/procedures/chunks
+        四类语料、keyword/bm25/vector/hybrid 全部策略都一致生效。
+        """
+        if acl is None or acl.unrestricted:
+            return results
+        corpus = self._corpus(corpus_type)
+        if corpus is None or not results:
+            return []
+        # 建立 id -> 原始记录 的映射（_doc_id / id / action_id 三种键）。
+        by_id: dict[str, dict] = {}
+        for rec in corpus.records:
+            for key in (rec.get("_doc_id"), rec.get("id"), rec.get("action_id")):
+                if key:
+                    by_id[str(key)] = rec
+        out: list[dict] = []
+        for r in results:
+            rid = r.get("id") or r.get("action_id")
+            if rid is None:
+                continue
+            rec = by_id.get(str(rid))
+            if rec is not None and acl_allows(acl, rec):
+                out.append(r)
+        return out
 
     def _search_single(
         self,
@@ -741,6 +792,7 @@ class RetrievalService:
         limit: int = 5,
         strategy: str = _DEFAULT_STRATEGY,
         rerank: Optional[bool] = None,
+        acl: Optional[ACLPolicy] = None,
     ) -> dict:
         """完整的 planner 检索流程，保持既有优先级:
 
@@ -750,27 +802,27 @@ class RetrievalService:
 
         传入的 strategy 会被透传给每一层检索，保证 Planner、API、CLI、
         MCP 共享同一套可配置检索策略。`rerank` 同样透传 (P1-3)，详见
-        `search`。
+        `search`。`acl` (P3-3) 透传给每一层做文档级过滤。
 
         Returns:
             dict: {query, actions, [procedures], [sections]}
         """
         actions = self.search(
             user_request, corpus_type="actions", top_k=limit,
-            strategy=strategy, rerank=rerank,
+            strategy=strategy, rerank=rerank, acl=acl,
         )
         result: dict[str, Any] = {"query": user_request, "actions": actions}
 
         if not actions:
             procedures = self.search(
                 user_request, corpus_type="procedures", top_k=limit,
-                strategy=strategy, rerank=rerank,
+                strategy=strategy, rerank=rerank, acl=acl,
             )
             result["procedures"] = procedures
             if not procedures:
                 sections = self.search(
                     user_request, corpus_type="sections", top_k=limit,
-                    strategy=strategy, rerank=rerank,
+                    strategy=strategy, rerank=rerank, acl=acl,
                 )
                 result["sections"] = sections
         else:
