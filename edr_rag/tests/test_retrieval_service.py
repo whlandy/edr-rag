@@ -191,6 +191,23 @@ def test_planner_retrieve_no_action_falls_back(service):
     assert result["sections"]  # section content contains "本节"
 
 
+@pytest.mark.parametrize("strategy", ["keyword", "bm25", "vector", "hybrid"])
+def test_planner_retrieve_strategy_threads_through(service, strategy):
+    # P0-3: planner_retrieve must accept a strategy and thread it to every tier.
+    result = service.planner_retrieve("配置代理", strategy=strategy)
+    assert result["query"] == "配置代理"
+    assert result["actions"], f"planner_retrieve({strategy}) should recall proxy action"
+    titles = [r["title"] for r in result["actions"]]
+    assert "配置代理服务器" in titles, f"planner_retrieve({strategy}) missing proxy action"
+    assert result["procedures"] == []
+    assert result["sections"] == []
+
+
+def test_planner_retrieve_invalid_strategy_raises(service):
+    with pytest.raises(ValueError):
+        service.planner_retrieve("配置代理", strategy="fuzzy")
+
+
 def test_edr_rag_api_delegates_to_service(tmp_path):
     # Regression: pure API (EdrRagAPI) must route through the shared service.
     from edr_rag.p2.api import EdrRagAPI
@@ -200,3 +217,25 @@ def test_edr_rag_api_delegates_to_service(tmp_path):
     assert api.get_action("network.configure_proxy")
     planner = api.planner_retrieve("配置代理")
     assert planner["actions"]
+
+
+def test_edr_rag_api_accepts_strategy(tmp_path):
+    # P0-3: every API entry point accepts and forwards a strategy.
+    from edr_rag.p2.api import EdrRagAPI
+    _write_artifacts(tmp_path)
+    api = EdrRagAPI(tmp_path)
+
+    # action_search
+    assert api.action_search("配置代理", strategy="bm25")
+    # procedure_search / manual_search (strategy + scoring alias)
+    assert api.procedure_search("配置代理", strategy="bm25")
+    assert api.manual_search("配置代理", strategy="keyword")
+    # planner_retrieve
+    pl = api.planner_retrieve("配置代理", strategy="hybrid")
+    assert pl["actions"]
+
+    # invalid strategy rejected at every level
+    with pytest.raises(ValueError):
+        api.action_search("配置代理", strategy="fuzzy")
+    with pytest.raises(ValueError):
+        api.planner_retrieve("配置代理", strategy="fuzzy")

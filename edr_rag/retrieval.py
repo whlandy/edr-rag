@@ -12,13 +12,16 @@
   - actions    -> actions.jsonl    (P2 动作目录，返回富字段)
   - chunks     -> chunks.jsonl     (P1 步骤分片)
 
-搜索策略 strategy: 'keyword' | 'bm25' | 'vector'
+搜索策略 strategy: 'keyword' | 'bm25' | 'vector' | 'hybrid'
   - keyword: 子串/词元重叠打分，动作对 title/action_id 加权
   - bm25:    轻量 BM25
   - vector:  可选 RAG extras 的向量检索；缺依赖时优雅降级到 bm25
-              (主链路始终可用 keyword/BM25)。
+             (主链路始终可用 keyword/BM25)
+  - hybrid:  未来融合策略占位；当前实现先用 bm25（保证所有入口即使
+             指定 hybrid 也绝不报错，后续在此处接入 keyword+vector 融合）。
 
-planner_retrieve 保持既有的 action -> procedure -> manual 优先级。
+planner_retrieve 保持既有的 action -> procedure -> manual 优先级，
+并把调用方传入的 strategy 透传给每一层检索。
 """
 
 from __future__ import annotations
@@ -36,7 +39,10 @@ _CORPUS_FILES: dict[str, str] = {
     "chunks": "chunks.jsonl",
 }
 
-_ALLOWED_STRATEGIES = ("keyword", "bm25", "vector")
+_ALLOWED_STRATEGIES = ("keyword", "bm25", "vector", "hybrid")
+# hybrid 为未来融合策略占位：当前实现落到 bm25（对齐 vector 缺依赖时的降级行为），
+# 后续接入 keyword+vector 融合时只需改进 _resolve_strategy。
+_DEFAULT_STRATEGY = "keyword"
 
 
 class RetrievalService:
@@ -81,7 +87,7 @@ class RetrievalService:
         self,
         query: str,
         corpus_type: str = "actions",
-        strategy: str = "keyword",
+        strategy: str = _DEFAULT_STRATEGY,
         filters: Optional[dict[str, Any]] = None,
         top_k: int = 5,
     ) -> list[dict]:
@@ -90,7 +96,8 @@ class RetrievalService:
         Args:
             query: 检索词 (支持中文)。
             corpus_type: 'sections' | 'procedures' | 'actions' | 'chunks'。
-            strategy: 'keyword' | 'bm25' | 'vector'；vector 缺依赖降级 bm25。
+            strategy: 'keyword' | 'bm25' | 'vector' | 'hybrid'；
+                vector/hybrid 缺依赖或为占位时降级 bm25。
             filters: dict，支持:
                 - 'risk':   动作过滤 (low/medium/high)
                 - 'status': 动作过滤 (candidate/needs_review/approved/published)
@@ -121,6 +128,8 @@ class RetrievalService:
                 f"unknown strategy '{strategy}'; expected one of {_ALLOWED_STRATEGIES}"
             )
 
+        strategy = self._resolve_strategy(strategy)
+
         if corpus_type == "actions":
             results = self._search_actions(
                 query, strategy=strategy, filters=filters, top_k=top_k
@@ -133,6 +142,19 @@ class RetrievalService:
             results = _apply_filter(results, filters)
 
         return results
+
+    @staticmethod
+    def _resolve_strategy(strategy: str) -> str:
+        """把可能降级的策略解析为实际执行的检索策略。
+
+        - 'hybrid' 当前为占位：先落到 bm25（保证主链路可用），
+          后续接入 keyword+vector 融合时在这里扩展。
+        - 其余 ('keyword'/'bm25'/'vector') 原样返回；vector 的缺依赖降级
+          由底层 JsonlCorpus.vector_search 处理。
+        """
+        if strategy == "hybrid":
+            return "bm25"
+        return strategy
 
     def _search_actions(
         self,
@@ -258,24 +280,36 @@ class RetrievalService:
 
     # ---------- Planner 编排 (action -> procedure -> manual) ----------
 
-    def planner_retrieve(self, user_request: str, limit: int = 5) -> dict:
+    def planner_retrieve(
+        self,
+        user_request: str,
+        limit: int = 5,
+        strategy: str = _DEFAULT_STRATEGY,
+    ) -> dict:
         """完整的 planner 检索流程，保持既有优先级:
 
           1. 先检索动作目录 (actions)
           2. 无动作结果 -> 检索流程 (procedures)
           3. 仍无结果 -> 检索手册章节 (sections)
 
+        传入的 strategy 会被透传给每一层检索，保证 Planner、API、CLI、
+        MCP 共享同一套可配置检索策略。
+
         Returns:
             dict: {query, actions, [procedures], [sections]}
         """
-        actions = self.search(user_request, corpus_type="actions", top_k=limit)
+        actions = self.search(user_request, corpus_type="actions", top_k=limit, strategy=strategy)
         result: dict[str, Any] = {"query": user_request, "actions": actions}
 
         if not actions:
-            procedures = self.search(user_request, corpus_type="procedures", top_k=limit)
+            procedures = self.search(
+                user_request, corpus_type="procedures", top_k=limit, strategy=strategy
+            )
             result["procedures"] = procedures
             if not procedures:
-                sections = self.search(user_request, corpus_type="sections", top_k=limit)
+                sections = self.search(
+                    user_request, corpus_type="sections", top_k=limit, strategy=strategy
+                )
                 result["sections"] = sections
         else:
             result["procedures"] = []

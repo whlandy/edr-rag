@@ -73,21 +73,33 @@ class EdrRagAgent:
 
     # ----- Knowledge search tools -----
 
-    def search_sections(self, query: str, limit: int = 5) -> list[dict]:
-        """Search P0 sections.jsonl."""
-        return self.retrieval.search(query, corpus_type="sections", top_k=limit)
+    def search_sections(self, query: str, limit: int = 5, strategy: str = "keyword") -> list[dict]:
+        """Search P0 sections.jsonl (via RetrievalService).
 
-    def search_procedures(self, query: str, limit: int = 5) -> list[dict]:
-        """Search P1 procedures.jsonl."""
-        return self.retrieval.search(query, corpus_type="procedures", top_k=limit)
+        strategy: 'keyword' | 'bm25' | 'vector' | 'hybrid' (default 'keyword').
+        """
+        return self.retrieval.search(query, corpus_type="sections", top_k=limit, strategy=strategy)
 
-    def search_actions(self, query: str, limit: int = 5) -> list[dict]:
-        """Search P2 actions.jsonl (rich action result)."""
-        return self.retrieval.search(query, corpus_type="actions", top_k=limit)
+    def search_procedures(self, query: str, limit: int = 5, strategy: str = "keyword") -> list[dict]:
+        """Search P1 procedures.jsonl (via RetrievalService).
 
-    def search_chunks(self, query: str, limit: int = 5) -> list[dict]:
-        """Search P1 chunks.jsonl."""
-        return self.retrieval.search(query, corpus_type="chunks", top_k=limit)
+        strategy: 'keyword' | 'bm25' | 'vector' | 'hybrid' (default 'keyword').
+        """
+        return self.retrieval.search(query, corpus_type="procedures", top_k=limit, strategy=strategy)
+
+    def search_actions(self, query: str, limit: int = 5, strategy: str = "keyword") -> list[dict]:
+        """Search P2 actions.jsonl (rich action result, via RetrievalService).
+
+        strategy: 'keyword' | 'bm25' | 'vector' | 'hybrid' (default 'keyword').
+        """
+        return self.retrieval.search(query, corpus_type="actions", top_k=limit, strategy=strategy)
+
+    def search_chunks(self, query: str, limit: int = 5, strategy: str = "keyword") -> list[dict]:
+        """Search P1 chunks.jsonl (via RetrievalService).
+
+        strategy: 'keyword' | 'bm25' | 'vector' | 'hybrid' (default 'keyword').
+        """
+        return self.retrieval.search(query, corpus_type="chunks", top_k=limit, strategy=strategy)
 
     def get_action(self, action_id: str) -> Optional[dict]:
         """Retrieve a specific action by action_id."""
@@ -228,6 +240,15 @@ def create_mcp_server(workdir: str) -> Server:
     agent = EdrRagAgent(workdir)
     app = Server("edr-rag")
 
+    # shared strategy property for search tools (keyword default; bm25 / vector / hybrid)
+    _STRATEGY_PROP = {
+        "type": "string",
+        "description": ("Retrieval strategy: keyword (default) | bm25 | vector | hybrid. "
+                        "vector/hybrid gracefully degrade to bm25 when optional RAG deps are absent."),
+        "enum": ["keyword", "bm25", "vector", "hybrid"],
+        "default": "keyword",
+    }
+
     @app.list_tools()
     async def handle_list_tools():
         return [
@@ -239,6 +260,7 @@ def create_mcp_server(workdir: str) -> Server:
                     "properties": {
                         "query": {"type": "string", "description": "Search query (CJK-safe, keyword based)"},
                         "limit": {"type": "integer", "description": "Max results", "default": 5},
+                        "strategy": _STRATEGY_PROP,
                     },
                     "required": ["query"],
                 },
@@ -251,6 +273,7 @@ def create_mcp_server(workdir: str) -> Server:
                     "properties": {
                         "query": {"type": "string", "description": "Search query (CJK-safe)"},
                         "limit": {"type": "integer", "description": "Max results", "default": 5},
+                        "strategy": _STRATEGY_PROP,
                     },
                     "required": ["query"],
                 },
@@ -263,6 +286,7 @@ def create_mcp_server(workdir: str) -> Server:
                     "properties": {
                         "query": {"type": "string", "description": "Search query (CJK-safe)"},
                         "limit": {"type": "integer", "description": "Max results", "default": 5},
+                        "strategy": _STRATEGY_PROP,
                     },
                     "required": ["query"],
                 },
@@ -365,11 +389,11 @@ def create_mcp_server(workdir: str) -> Server:
     async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         try:
             if name == "search_knowledge":
-                results = agent.search_sections(arguments["query"], arguments.get("limit", 5))
+                results = agent.search_sections(arguments["query"], arguments.get("limit", 5), strategy=arguments.get("strategy", "keyword"))
             elif name == "search_procedures":
-                results = agent.search_procedures(arguments["query"], arguments.get("limit", 5))
+                results = agent.search_procedures(arguments["query"], arguments.get("limit", 5), strategy=arguments.get("strategy", "keyword"))
             elif name == "search_actions":
-                results = agent.search_actions(arguments["query"], arguments.get("limit", 5))
+                results = agent.search_actions(arguments["query"], arguments.get("limit", 5), strategy=arguments.get("strategy", "keyword"))
             elif name == "get_action":
                 result = agent.get_action(arguments["action_id"])
                 results = result if result else {"error": "not found"}

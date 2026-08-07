@@ -2,7 +2,7 @@
 
 Usage:
     python -m tools.edr_rag.p1.cli extract-procedures --manual-id <id> --workdir <path>
-    python -m tools.edr_rag.p1.cli search --query <query> --workdir <path> [--type procedure] [--scoring keyword|bm25] [--limit 5]
+    python -m tools.edr_rag.p1.cli search --query <query> --workdir <path> [--type procedure] [--scoring keyword|bm25] [--strategy keyword|bm25] [--limit 5]
 """
 
 from __future__ import annotations
@@ -88,7 +88,11 @@ def _cli_search(args: argparse.Namespace):
 
     corpus = JsonlCorpus.from_file(path)
 
-    if args.scoring == "bm25":
+    # 统一检索策略：--strategy 为统一命名，--scoring 为历史别名。
+    # 两者都指定时以 --strategy 为准（保持 backward compatibility）。
+    strategy = args.strategy or args.scoring or "keyword"
+
+    if strategy == "bm25":
         results = corpus.bm25_search(args.query, limit=args.limit)
     else:
         results = corpus.keyword_search(args.query, limit=args.limit)
@@ -97,7 +101,7 @@ def _cli_search(args: argparse.Namespace):
         print(f"No results found for query: {args.query}")
         sys.exit(0)
 
-    print(f"Search results for '{args.query}' ({args.type}, {args.scoring}):")
+    print(f"Search results for '{args.query}' ({args.type}, {strategy}):")
     for r in results:
         print(f"\n  [{r['type']}] {r['id']}  (score: {r['score']})")
         if r.get("source") and r["source"].get("file"):
@@ -133,7 +137,9 @@ def main():
     search_parser.add_argument("--type", default="procedure", choices=["section", "procedure", "step"],
                                help="Artifact type to search (default: procedure)")
     search_parser.add_argument("--scoring", default="keyword", choices=["keyword", "bm25"],
-                               help="Scoring method (default: keyword)")
+                               help="Scoring method (default: keyword; historical alias of --strategy)")
+    search_parser.add_argument("--strategy", default=None, choices=["keyword", "bm25", "vector", "hybrid"],
+                               help="Retrieval strategy (unified naming; overrides --scoring). vector/hybrid degrade to bm25 at this level")
     search_parser.add_argument("--limit", type=int, default=5, help="Max results")
 
     args = parser.parse_args()

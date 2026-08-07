@@ -2,8 +2,9 @@
 
 Usage:
     python -m tools.edr_rag.p2.cli build-actions --workdir <path>
-    python -m tools.edr_rag.p2.cli action-search --query <q> --workdir <path> [--limit 5] [--risk medium] [--status published]
+    python -m tools.edr_rag.p2.cli action-search --query <q> --workdir <path> [--limit 5] [--strategy keyword|bm25|vector|hybrid] [--risk medium] [--status published]
     python -m tools.edr_rag.p2.cli get-action <action_id> --workdir <path>
+    python -m tools.edr_rag.p2.cli planner-retrieve --query <q> --workdir <path> [--strategy keyword] [--limit 5]
 """
 
 from __future__ import annotations
@@ -56,7 +57,7 @@ def _cli_action_search(args: argparse.Namespace):
     results = service.search(
         args.query,
         corpus_type="actions",
-        strategy="keyword",
+        strategy=args.strategy,
         filters=filters,
         top_k=args.limit,
     )
@@ -71,9 +72,12 @@ def _cli_action_search(args: argparse.Namespace):
 
     print(f"Action search results for '{args.query}':")
     for r in results:
-        print(f"\n  [{r['risk']}] {r['id']}  (score: {r['score']})")
-        print(f"     title: {r['title']}")
-        print(f"     status: {r['status']} | confidence: {r['confidence']}")
+        print(f"\n  [{r.get('risk', '-')}] {r.get('id', r.get('title', '?'))}  (score: {r.get('score')})")
+        print(f"     title: {r.get('title')}")
+        if r.get("status") is not None:
+            print(f"     status: {r.get('status')}")
+        if r.get("confidence") is not None:
+            print(f"     confidence: {r.get('confidence')}")
         if r.get("snippet"):
             print(f"     {r['snippet']}")
 
@@ -95,7 +99,7 @@ def _cli_planner_retrieve(args: argparse.Namespace):
     from ..retrieval import RetrievalService
 
     service = RetrievalService(args.workdir)
-    result = service.planner_retrieve(args.query, limit=args.limit)
+    result = service.planner_retrieve(args.query, limit=args.limit, strategy=args.strategy)
 
     print(f"Planner retrieval for: {args.query}")
     print()
@@ -103,9 +107,10 @@ def _cli_planner_retrieve(args: argparse.Namespace):
     if result.get("actions"):
         print("=== Actions (priority 1) ===")
         for r in result["actions"]:
-            print(f"  [{r['risk']}] {r['id']} (score: {r['score']})")
-            print(f"    title: {r['title']}")
-            print(f"    status: {r['status']}")
+            print(f"  [{r.get('risk', '-')}] {r.get('id', r.get('title', '?'))} (score: {r.get('score')})")
+            print(f"    title: {r.get('title')}")
+            if r.get("status") is not None:
+                print(f"    status: {r.get('status')}")
             if r.get("snippet"):
                 print(f"    snippet: {r['snippet'][:100]}")
             print()
@@ -151,6 +156,9 @@ def main():
     search_parser.add_argument("--query", required=True, help="Search query")
     search_parser.add_argument("--workdir", required=True, help="Work directory")
     search_parser.add_argument("--limit", type=int, default=5, help="Max results")
+    search_parser.add_argument("--strategy", default="keyword",
+                               choices=["keyword", "bm25", "vector", "hybrid"],
+                               help="Retrieval strategy (default: keyword; vector/hybrid degrade to bm25 without optional RAG deps)")
     search_parser.add_argument("--risk", default=None, choices=["low", "medium", "high"],
                                help="Filter by risk level")
     search_parser.add_argument("--status", default=None,
@@ -173,6 +181,9 @@ def main():
     planner_parser.add_argument("--query", required=True, help="User request or query")
     planner_parser.add_argument("--workdir", required=True, help="Work directory")
     planner_parser.add_argument("--limit", type=int, default=5, help="Max results per tier")
+    planner_parser.add_argument("--strategy", default="keyword",
+                                choices=["keyword", "bm25", "vector", "hybrid"],
+                                help="Retrieval strategy threaded to every tier (default: keyword)")
 
     args = parser.parse_args()
     if not args.subcommand:

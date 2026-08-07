@@ -49,8 +49,12 @@ class EdrRagAPI:
         limit: int = 5,
         risk_filter: Optional[str] = None,
         status_filter: Optional[str] = None,
+        strategy: str = "keyword",
     ) -> list[dict]:
-        """Search the action catalog (delegated to RetrievalService)."""
+        """Search the action catalog (delegated to RetrievalService).
+
+        strategy: 'keyword' | 'bm25' | 'vector' | 'hybrid' (default 'keyword').
+        """
         filters = {}
         if risk_filter:
             filters["risk"] = risk_filter
@@ -59,7 +63,7 @@ class EdrRagAPI:
         return self._service.search(
             query,
             corpus_type="actions",
-            strategy="keyword",
+            strategy=strategy,
             filters=filters,
             top_k=limit,
         )
@@ -77,13 +81,21 @@ class EdrRagAPI:
         self,
         query: str,
         limit: int = 5,
-        scoring: str = "keyword",
+        scoring: Optional[str] = None,
+        strategy: Optional[str] = None,
     ) -> list[dict]:
-        """Search P1 procedures (fallback if action_search has no results)."""
+        """Search P1 procedures (fallback if action_search has no results).
+
+        strategy: 'keyword' | 'bm25' | 'vector' | 'hybrid' (default 'keyword').
+        `scoring` 为历史别名参数，与 `strategy` 等价；两者都传时以
+        `strategy` 为准（保持 backward compatibility）。
+        """
+        if strategy is None:
+            strategy = scoring or "keyword"
         return self._service.search(
             query,
             corpus_type="procedures",
-            strategy=scoring,
+            strategy=strategy,
             top_k=limit,
         )
 
@@ -93,13 +105,21 @@ class EdrRagAPI:
         self,
         query: str,
         limit: int = 5,
-        scoring: str = "keyword",
+        scoring: Optional[str] = None,
+        strategy: Optional[str] = None,
     ) -> list[dict]:
-        """Search P0 sections (for explanation or troubleshooting only)."""
+        """Search P0 sections (for explanation or troubleshooting only).
+
+        strategy: 'keyword' | 'bm25' | 'vector' | 'hybrid' (default 'keyword').
+        `scoring` 为历史别名参数，与 `strategy` 等价；两者都传时以
+        `strategy` 为准。
+        """
+        if strategy is None:
+            strategy = scoring or "keyword"
         return self._service.search(
             query,
             corpus_type="sections",
-            strategy=scoring,
+            strategy=strategy,
             top_k=limit,
         )
 
@@ -109,10 +129,11 @@ class EdrRagAPI:
         self,
         user_request: str,
         limit: int = 5,
+        strategy: str = "keyword",
     ) -> dict:
         """Orchestrate the full planner retrieval flow (action → procedure → manual).
 
         Delegates to RetrievalService.planner_retrieve which preserves the
-        §6 priority order.
+        §6 priority order and threads `strategy` to each retrieval tier.
         """
-        return self._service.planner_retrieve(user_request, limit=limit)
+        return self._service.planner_retrieve(user_request, limit=limit, strategy=strategy)
