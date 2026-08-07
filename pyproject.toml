@@ -28,6 +28,7 @@ edr-rag = "edr_rag.cli:main"
 edr-rag-p1 = "edr_rag.p1.cli:main"
 edr-rag-p2 = "edr_rag.p2.cli:main"
 edr-rag-mcp = "edr_rag.p3.server:main"
+edr-rag-eval = "edr_rag.eval.cli:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -35,6 +36,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["edr_rag"]
+# 随包携带评测集数据 (JSONL)，保证安装后 edr-rag-eval 可直接使用。
+force-include = { "edr_rag/eval/data" = "edr_rag/eval/data" }
 
 [tool.pytest.ini_options]
 testpaths = ["edr_rag"]

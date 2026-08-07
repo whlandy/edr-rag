@@ -1,0 +1,30 @@
+{"qid": "q001", "corpus_type": "actions", "query": "如何配置代理服务器", "relevant": ["network.configure_proxy"], "paraphrases": ["怎么设置代理", "代理服务器怎么配", "配置网络代理的方法", "如何把代理设置好"], "top_k": 5}
+{"qid": "q002", "corpus_type": "actions", "query": "重置系统", "relevant": ["system.reset_system"], "paraphrases": ["恢复出厂设置", "系统重置一下", "把系统初始化", "重置计算机"], "top_k": 5}
+{"qid": "q003", "corpus_type": "actions", "query": "查看安全状态", "relevant": ["status.view_security_state"], "paraphrases": ["安全状态怎么看", "查看防护状态", "了解一下安全情况", "安全状态在哪看"], "top_k": 5}
+{"qid": "q004", "corpus_type": "actions", "query": "开启实时防护", "relevant": ["protection.enable_realtime"], "paraphrases": ["打开实时监控", "启动实时防护功能", "实时查杀怎么开", "开启实时病毒防护"], "top_k": 5}
+{"qid": "q005", "corpus_type": "actions", "query": "更新病毒库", "relevant": ["update.virus_database"], "paraphrases": ["升级病毒特征库", "更新病毒特征库", "病毒库怎么更新", "升级病毒库"], "top_k": 5}
+{"qid": "q006", "corpus_type": "actions", "query": "隔离风险进程", "relevant": ["process.quarantine_risky"], "paraphrases": ["把危险进程隔离", "风险进程如何隔离", "隔离恶意进程", "如何处理风险进程"], "top_k": 5}
+{"qid": "q007", "corpus_type": "actions", "query": "导出安全日志", "relevant": ["log.export_security_log"], "paraphrases": ["安全日志怎么导出", "导出日志文件", "备份安全日志", "日志导出来"], "top_k": 5}
+{"qid": "q008", "corpus_type": "actions", "query": "配置数据防泄漏策略", "relevant": ["dlp.configure_policy"], "paraphrases": ["数据防泄漏怎么配", "设置DLP策略", "配置防泄密策略", "数据防泄漏规则怎么设"], "top_k": 5}
+{"qid": "q009", "corpus_type": "actions", "query": "设置扫描计划", "relevant": ["scan.schedule"], "paraphrases": ["扫描计划怎么设", "配置定时扫描", "定时查杀设置", "设置每日扫描"], "top_k": 5}
+{"qid": "q010", "corpus_type": "actions", "query": "安装终端客户端", "relevant": ["deploy.install_agent"], "paraphrases": ["客户端怎么装", "部署终端代理", "安装EDR客户端", "装安全终端"], "top_k": 5, "filter": {"status": "approved"}, "filter_expected": ["deploy.install_agent"]}
+{"qid": "q011", "corpus_type": "procedures", "query": "配置代理服务器的详细步骤", "relevant": ["procedure.network.configure_proxy"], "paraphrases": ["配置代理的步骤有哪些", "代理如何一步步配置", "配置代理服务器流程", "代理配置具体怎么操作"], "top_k": 5}
+{"qid": "q012", "corpus_type": "procedures", "query": "重置系统的操作流程", "relevant": ["procedure.system.reset_system"], "paraphrases": ["系统重置流程", "重置系统怎么操作", "初始化系统步骤", "系统恢复步骤"], "top_k": 5}
+{"qid": "q013", "corpus_type": "chunks", "query": "打开网络设置", "relevant": ["node.chunk.step.网络.代理.1"], "paraphrases": ["网络设置在哪打开", "怎么进入网络设置", "打开网络配置界面", "进入网络设置页面"], "top_k": 5}
+{"qid": "q014", "corpus_type": "chunks", "query": "输入代理地址", "relevant": ["node.chunk.step.网络.代理.3"], "paraphrases": ["代理地址怎么填", "输入代理服务器地址", "在哪里填代理地址", "填写代理地址"], "top_k": 5}
+{"qid": "q015", "corpus_type": "sections", "query": "代理服务器概述", "relevant": ["section.network.proxy"], "paraphrases": ["代理是什么", "代理概念介绍", "代理服务器简介", "什么是代理"], "top_k": 5}
+{"qid": "q016", "corpus_type": "sections", "query": "安全状态功能介绍", "relevant": ["section.status"], "paraphrases": ["安全状态是干嘛的", "安全状态功能说明", "安全状态介绍", "安全状态模块说明"], "top_k": 5}
+{"qid": "q017", "corpus_type": "sections", "query": "网络设置说明", "relevant": ["section.network.index"], "paraphrases": ["网络设置简介", "网络设置是什么", "网络配置说明", "网络设置板块介绍"], "top_k": 5}
+{"qid": "q018", "corpus_type": "procedures", "query": "开启实时防护流程", "relevant": ["procedure.protection.enable_realtime"], "paraphrases": ["实时防护怎么开启", "开实时防护步骤", "实时监控开启流程", "实时防护操作步骤"], "top_k": 5}
+{"qid": "q019", "corpus_type": "procedures", "query": "更新病毒库流程", "relevant": ["procedure.update.virus_database"], "paraphrases": ["病毒库升级步骤", "更新病毒库怎么操作", "病毒库更新流程", "升级病毒库步骤"], "top_k": 5}
+{"qid": "q020", "corpus_type": "chunks", "query": "选择代理", "relevant": ["node.chunk.step.网络.代理.2"], "paraphrases": ["点选代理选项", "选择代理模式", "挑代理", "选代理"], "top_k": 5}
+{"qid": "q021", "corpus_type": "actions", "query": "查看高风险告警", "relevant": ["alert.view_high_risk"], "paraphrases": ["高风险告警怎么看", "查看高危告警", "高风险警报查看", "告警列表查看"], "top_k": 5, "filter": {"risk": "high"}, "filter_expected": ["alert.view_high_risk"]}
+{"qid": "q022", "corpus_type": "actions", "query": "恢复隔离文件", "relevant": ["quarantine.restore_file"], "paraphrases": ["把隔离的文件恢复", "恢复已隔离文件", "隔离区文件恢复", "还原隔离文件"], "top_k": 5}
+{"qid": "q023", "corpus_type": "actions", "query": "配置邮件告警通知", "relevant": ["alert.configure_mail"], "paraphrases": ["邮件告警怎么设", "设置邮件通知", "告警邮件配置", "配置告警邮件发送"], "top_k": 5}
+{"qid": "q024", "corpus_type": "procedures", "query": "导出安全日志步骤", "relevant": ["procedure.log.export_security_log"], "paraphrases": ["安全日志怎么导出流程", "导出日志操作步骤", "日志导出怎么做", "安全日志导出步骤"], "top_k": 5}
+{"qid": "q025", "corpus_type": "procedures", "query": "隔离风险进程步骤", "relevant": ["procedure.process.quarantine_risky"], "paraphrases": ["风险进程怎么隔离", "隔离进程操作流程", "危险进程隔离步骤", "进程隔离怎么做"], "top_k": 5}
+{"qid": "q026", "corpus_type": "actions", "query": "卸载终端客户端", "relevant": ["deploy.uninstall_agent"], "paraphrases": ["客户端怎么卸载", "卸载EDR客户端", "移除终端代理", "卸载安全终端"], "top_k": 5}
+{"qid": "q027", "corpus_type": "chunks", "query": "点击应用保存", "relevant": ["node.chunk.step.网络.代理.4"], "paraphrases": ["点保存应用", "应用并保存配置", "保存并应用设置", "点击应用按钮"], "top_k": 5}
+{"qid": "q028", "corpus_type": "sections", "query": "数据防泄漏简介", "relevant": ["section.dlp"], "paraphrases": ["DLP是什么", "数据防泄漏介绍", "防泄密功能简介", "数据防泄漏模块"], "top_k": 5}
+{"qid": "q029", "corpus_type": "actions", "query": "配置日志保留策略", "relevant": ["log.configure_retention"], "paraphrases": ["日志保留多久怎么设", "设置日志保存期限", "日志保留策略配置", "日志清理设置"], "top_k": 5}
+{"qid": "q030", "corpus_type": "actions", "query": "查看已隔离文件", "relevant": ["quarantine.list"], "paraphrases": ["隔离区在哪看", "查看隔离文件列表", "隔离文件列表查看", "隔离区内容查看"], "top_k": 5}
