@@ -81,6 +81,26 @@ def _cmd_validate(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def _cmd_validate_index(args: argparse.Namespace) -> None:
+    """Validate the index manifest (P0-5): schema/hash/source/orphan checks."""
+    from .index_manifest import validate_index_manifest
+
+    res = validate_index_manifest(
+        args.workdir, chain=args.chain, artifacts=args.artifacts or None
+    )
+    print(res.message)
+    if res.stale_files:
+        print(f"  内容已变化: {', '.join(res.stale_files)}")
+    if res.ok:
+        return
+    # refuse 级结论 (schema 不匹配 / 孤儿残留) -> 非零退出
+    if res.refuse:
+        print("拒绝读取: 请重新 ingest / generate 后再使用索引", file=sys.stderr)
+        sys.exit(2)
+    # warning 级 (内容/源头过期) -> 非零退出 (提示但不阻止重建)
+    sys.exit(1)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="CHM ingestion pipeline — P0: extract, parse, normalize",
@@ -103,6 +123,14 @@ def main() -> None:
                                  help="Working directory (default: ~/Desktop/edr-chm-rag-work)")
     validate_parser.add_argument("--manual-id", default=None, help="Expected manual_id for validation")
 
+    # validate-index
+    vi_parser = subparsers.add_parser("validate-index", help="Validate index manifest (schema/hash/source/orphan)")
+    vi_parser.add_argument("--workdir", required=True, help="Work directory")
+    vi_parser.add_argument("--chain", default=None, choices=["p1", "p2"],
+                           help="Expected chain (optional)")
+    vi_parser.add_argument("--artifact", dest="artifacts", action="append", default=None,
+                           help="Artifact filename(s) to hash-check (repeatable; default: all tracked)")
+
     args = parser.parse_args()
     _configure_logging(args.verbose)
 
@@ -110,6 +138,8 @@ def main() -> None:
         _cmd_ingest(args)
     elif args.command == "validate":
         _cmd_validate(args)
+    elif args.command == "validate-index":
+        _cmd_validate_index(args)
     else:
         parser.print_help()
         sys.exit(1)

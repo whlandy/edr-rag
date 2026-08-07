@@ -600,12 +600,18 @@ def write_p1_artifacts(
     manual_id: str,
     product: str,
 ) -> Path:
-    """Write procedures.jsonl, chunks.jsonl, and p1_metadata.json under workdir.
+    """Write procedures.jsonl, chunks.jsonl, p1_metadata.json and index_manifest.json.
+
+    Also maintains the index manifest (P0-5): computes content hashes for
+    procedures/chunks/sections and records chain="p1" with the source hash
+    from P0 manifest.json, so later readers can detect staleness.
 
     Returns the path to p1_metadata.json.
     """
     import json
     from datetime import datetime, timezone
+
+    from ..index_manifest import maintain_index
 
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
@@ -629,4 +635,11 @@ def write_p1_artifacts(
     }
     meta_path = workdir / "p1_metadata.json"
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # P0-5: maintain index manifest so downstream can detect staleness.
+    maintain_index(
+        workdir,
+        chain="p1",
+        artifacts=["sections.jsonl", "procedures.jsonl", "chunks.jsonl"],
+    )
     return meta_path

@@ -216,10 +216,14 @@ def write_p2_artifacts(
 ) -> tuple[Path, Path]:
     """Write actions.jsonl and actions.yaml under workdir.
 
-    Also writes p2_metadata.json.
+    Also writes p2_metadata.json and maintains the index manifest (P0-5):
+    records content hashes for actions/procedures/chunks/sections with
+    chain="p2" and the source hash from P0 manifest.
 
     Returns (jsonl_path, yaml_path).
     """
+    from ..index_manifest import maintain_index
+
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
 
@@ -250,5 +254,12 @@ def write_p2_artifacts(
         meta["by_risk"][e.risk] = meta["by_risk"].get(e.risk, 0) + 1
     meta_path = workdir / "p2_metadata.json"
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # P0-5: maintain index manifest for the p2 chain.
+    maintain_index(
+        workdir,
+        chain="p2",
+        artifacts=["sections.jsonl", "procedures.jsonl", "chunks.jsonl", "actions.jsonl"],
+    )
 
     return jsonl_path, yaml_path
