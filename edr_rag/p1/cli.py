@@ -3,6 +3,7 @@
 Usage:
     python -m tools.edr_rag.p1.cli extract-procedures --manual-id <id> --workdir <path>
     python -m tools.edr_rag.p1.cli search --query <query> --workdir <path> [--type procedure] [--scoring keyword|bm25] [--strategy keyword|bm25] [--limit 5]
+    python -m tools.edr_rag.p1.cli ingest-llama --workdir <path> [--corpus chunks] [--force-llama]
 """
 
 from __future__ import annotations
@@ -112,6 +113,51 @@ def _cli_search(args: argparse.Namespace):
             print(f"     snippet: {snip[:100]}")
 
 
+def _cli_ingest_llama(args: argparse.Namespace):
+    """运行可选的 LlamaIndex 摄取管线（缺依赖自动降级到标准库结构化切分）。"""
+    from .llama_ingest import IngestResult, llama_index_available, run_ingestion_pipeline
+
+    workdir = Path(args.workdir)
+    corpus = args.corpus
+
+    if args.force_llama and not llama_index_available():
+        print(
+            "Error: --force-llama requires llama-index-core. "
+            "Install with: pip install -e '.[rag]'",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        result: IngestResult = run_ingestion_pipeline(
+            workdir,
+            corpus,
+            chunk_size=args.chunk_size,
+            overlap=args.overlap,
+            force_llama=args.force_llama,
+        )
+    except Exception as e:  # force-llama 时 LlamaIndexUnavailable 会冒出
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    mode = result.mode
+    if mode == "llama":
+        mode_note = "LlamaIndex IngestionPipeline"
+    else:
+        mode_note = "标准库结构化切分 (llama-index-core 未安装或不可用)"
+
+    print(
+        f"ingested corpus={corpus} mode={mode} ({mode_note})"
+    )
+    print(f"  source_records     = {result.source_records}")
+    print(f"  produced_nodes     = {result.produced_nodes}")
+    print(f"  new_nodes          = {result.new_nodes}")
+    print(f"  duplicates_skipped = {result.duplicates_skipped}")
+    print(f"  cache              = {result.cache_path}")
+    if result.error:
+        print(f"  note               = {result.error}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="P1: procedure extraction and local search CLI",
@@ -142,6 +188,22 @@ def main():
                                help="Retrieval strategy (unified naming; overrides --scoring). vector/hybrid degrade to bm25 at this level")
     search_parser.add_argument("--limit", type=int, default=5, help="Max results")
 
+    # ingest-llama (P1-1: 可选 LlamaIndex 摄取管线)
+    il_parser = subparsers.add_parser(
+        "ingest-llama",
+        help="Run optional LlamaIndex ingestion pipeline (degrades to stdlib split)",
+    )
+    il_parser.add_argument("--workdir", required=True, help="Work directory (same as P0 --workdir)")
+    il_parser.add_argument("--corpus", default="chunks",
+                           choices=["chunks", "procedures", "sections", "actions"],
+                           help="Corpus type to ingest (default: chunks)")
+    il_parser.add_argument("--chunk-size", type=int, default=512,
+                           help="Max node length in chars (default: 512)")
+    il_parser.add_argument("--overlap", type=int, default=0,
+                           help="Overlap for re-splitting long nodes (default: 0)")
+    il_parser.add_argument("--force-llama", action="store_true",
+                           help="Require LlamaIndex; fail instead of degrading if absent")
+
     args = parser.parse_args()
     if not args.subcommand:
         parser.print_help()
@@ -151,6 +213,8 @@ def main():
         _cli_extract_procedures(args)
     elif args.subcommand == "search":
         _cli_search(args)
+    elif args.subcommand == "ingest-llama":
+        _cli_ingest_llama(args)
 
 
 if __name__ == "__main__":
