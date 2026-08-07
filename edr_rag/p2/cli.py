@@ -13,6 +13,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Optional
 
 
 def _cli_build_actions(args: argparse.Namespace):
@@ -45,6 +46,13 @@ def _cli_build_actions(args: argparse.Namespace):
     print(f"  YAML:  {yaml_path}")
 
 
+def _rerank_arg(value: Optional[str]) -> Optional[bool]:
+    """把 CLI 的 --rerank (auto/on/off) 映射为 service 的 Optional[bool]。"""
+    if value is None or value == "auto":
+        return None
+    return value == "on"
+
+
 def _cli_action_search(args: argparse.Namespace):
     from ..retrieval import RetrievalService
 
@@ -60,6 +68,7 @@ def _cli_action_search(args: argparse.Namespace):
         strategy=args.strategy,
         filters=filters,
         top_k=args.limit,
+        rerank=_rerank_arg(args.rerank),
     )
 
     if not results:
@@ -99,7 +108,9 @@ def _cli_planner_retrieve(args: argparse.Namespace):
     from ..retrieval import RetrievalService
 
     service = RetrievalService(args.workdir)
-    result = service.planner_retrieve(args.query, limit=args.limit, strategy=args.strategy)
+    result = service.planner_retrieve(
+        args.query, limit=args.limit, strategy=args.strategy, rerank=_rerank_arg(args.rerank)
+    )
 
     print(f"Planner retrieval for: {args.query}")
     print()
@@ -158,7 +169,9 @@ def main():
     search_parser.add_argument("--limit", type=int, default=5, help="Max results")
     search_parser.add_argument("--strategy", default="keyword",
                                choices=["keyword", "bm25", "vector", "hybrid"],
-                               help="Retrieval strategy (default: keyword; vector/hybrid degrade to bm25 without optional RAG deps)")
+                               help="Retrieval strategy (default: keyword; vector degrades to bm25 and hybrid to RRF fusion without optional RAG deps)")
+    search_parser.add_argument("--rerank", type=str, choices=["auto", "on", "off"], default=None,
+                               help="Cross-encoder rerank toggle for hybrid (default: auto = enable when deps available, else skip)")
     search_parser.add_argument("--risk", default=None, choices=["low", "medium", "high"],
                                help="Filter by risk level")
     search_parser.add_argument("--status", default=None,

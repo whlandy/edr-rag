@@ -17,8 +17,10 @@
   - bm25:    轻量 BM25
   - vector:  可选 RAG extras 的向量检索；缺依赖时优雅降级到 bm25
              (主链路始终可用 keyword/BM25)
-  - hybrid:  未来融合策略占位；当前实现先用 bm25（保证所有入口即使
-             指定 hybrid 也绝不报错，后续在此处接入 keyword+vector 融合）。
+  - hybrid:  多路召回 -> RRF 融合 -> (可选) cross-encoder rerank -> top K
+             (P1-3)。召回侧融合 keyword + bm25 (+ 有 embedder 时叠加 vector)，
+             融合后按需做 bge-reranker 精排；reranker 为可选依赖，缺依赖或
+             通过 rerank=False / 环境变量 EDR_RAG_RERANK=0 关闭时静默跳过。
 
 planner_retrieve 保持既有的 action -> procedure -> manual 优先级，
 并把调用方传入的 strategy 透传给每一层检索。
@@ -32,6 +34,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .p1.search import JsonlCorpus
+from .rerank import rrf_fuse, rerank, RERANK_ENABLED
 
 # 允许的 corpus_type -> 对应 JSONL 文件名
 _CORPUS_FILES: dict[str, str] = {
@@ -119,6 +122,7 @@ class RetrievalService:
         filters: Optional[dict[str, Any]] = None,
         top_k: int = 5,
         recall_budget: int = 4,
+        rerank: Optional[bool] = None,
     ) -> list[dict]:
         """统一检索入口。
 
@@ -126,7 +130,8 @@ class RetrievalService:
             query: 检索词 (支持中文)。
             corpus_type: 'sections' | 'procedures' | 'actions' | 'chunks'。
             strategy: 'keyword' | 'bm25' | 'vector' | 'hybrid'；
-                vector/hybrid 缺依赖或为占位时降级 bm25。
+                vector 缺依赖时降级 bm25；hybrid 走「多路召回 -> RRF 融合
+                -> (可选) cross-encoder rerank -> top K」(P1-3)。
             filters: dict，支持:
                 - 'risk':   动作过滤 (low/medium/high)
                 - 'status': 动作过滤 (candidate/needs_review/approved/published)
@@ -136,6 +141,9 @@ class RetrievalService:
                 (top_k * recall_budget) 打分排序，再对候选池做 metadata
                 过滤；结果不足时循环扩大候选池直到满足或耗尽语料。该倍数
                 只影响候选池大小，不改变最终返回条数 (仍 ≤ top_k)。
+            rerank: cross-encoder 精排开关 (P1-3)。None 表示跟随全局默认
+                (可选依赖可用即启用，否则跳过，见 rerank.RERANK_ENABLED)；
+                True 强制尝试、False 关闭。仅对 hybrid 策略生效。
 
         Returns:
             结果 dict 列表。actions 返回富字段
@@ -146,6 +154,7 @@ class RetrievalService:
         filters = filters or {}
         top_k = max(int(top_k), 0)
         recall_budget = max(int(recall_budget), 1)
+        rerank_enabled = RERANK_ENABLED if rerank is None else bool(rerank)
 
         # 精确 id 获取模式：不做全文打分，直接按主键取。
         if filters.get("id") is not None:
@@ -163,6 +172,16 @@ class RetrievalService:
             )
 
         strategy = self._resolve_strategy(strategy)
+
+        if strategy == "hybrid":
+            return self._search_hybrid(
+                query,
+                corpus_type,
+                filters=filters,
+                top_k=top_k,
+                recall_budget=recall_budget,
+                rerank_enabled=rerank_enabled,
+            )
 
         if corpus_type == "actions":
             results = self._search_actions(
@@ -185,13 +204,10 @@ class RetrievalService:
     def _resolve_strategy(strategy: str) -> str:
         """把可能降级的策略解析为实际执行的检索策略。
 
-        - 'hybrid' 当前为占位：先落到 bm25（保证主链路可用），
-          后续接入 keyword+vector 融合时在这里扩展。
-        - 其余 ('keyword'/'bm25'/'vector') 原样返回；vector 的缺依赖降级
-          由底层 JsonlCorpus.vector_search 处理。
+        - 'vector' 的缺依赖降级由底层 JsonlCorpus.vector_search 处理。
+        - 其余 ('keyword'/'bm25'/'hybrid') 原样返回；hybrid 由本服务
+          的 `_search_hybrid` 执行完整的融合 + rerank 流程 (P1-3)。
         """
-        if strategy == "hybrid":
-            return "bm25"
         return strategy
 
     def _search_actions(
@@ -227,6 +243,133 @@ class RetrievalService:
             budget = min(total, max(budget * 2, budget + 1))
 
         return filtered[:top_k]
+
+    # ---------- hybrid (P1-3): 多路召回 -> RRF 融合 -> rerank -> top K ----------
+
+    def _search_hybrid(
+        self,
+        query: str,
+        corpus_type: str,
+        filters: dict[str, Any],
+        top_k: int,
+        recall_budget: int,
+        rerank_enabled: bool,
+    ) -> list[dict]:
+        """hybrid 完整流程。
+
+        多路召回 (keyword + bm25，有 embedder 时叠加 vector) 各自打分，
+        用 RRF 融合成单一排名，然后 (可选) 做 cross-encoder rerank 精排，
+        最后应用 metadata 过滤并取 top K。
+
+        actions 复用 P0-4 的召回预算循环：融合后按预算扩候选池、过滤、
+        不足则倍增预算，直到满足 top_k 或耗尽语料；rerank 在过滤后的
+        最终候选池上执行一次 (避免每个循环迭代都跑昂贵的精排)。
+        """
+        corpus = self._corpus(corpus_type)
+        if corpus is None:
+            return []
+
+        if corpus_type == "actions":
+            return self._search_actions_hybrid(
+                corpus, query, filters, top_k, recall_budget, rerank_enabled
+            )
+        return self._search_generic_hybrid(corpus, query, filters, top_k, rerank_enabled)
+
+    def _embedder_available(self) -> bool:
+        """embedding 是否可用 (用于决定 hybrid 是否叠加 vector 一路召回)。"""
+        from .p1.search import _optional_embedder
+
+        return _optional_embedder() is not None
+
+    def _search_generic_hybrid(
+        self,
+        corpus: JsonlCorpus,
+        query: str,
+        filters: dict[str, Any],
+        top_k: int,
+        rerank_enabled: bool,
+    ) -> list[dict]:
+        """generic 语料 (sections/procedures/chunks) 的融合检索。"""
+        # 每路召回带上限 (top_k * 固定倍数)，保证融合候选池有足够区分度。
+        recall_cap = max(top_k * 4, top_k)
+
+        lists: list[list[dict]] = []
+        kw = corpus.keyword_search(query, limit=recall_cap)
+        if kw:
+            lists.append(kw)
+        bm = corpus.bm25_search(query, limit=recall_cap)
+        if bm:
+            lists.append(bm)
+        # 有 embedder 时叠加 vector 一路；缺依赖时 vector 会降级成 bm25，
+        # 为避免重复计数同一信号，仅在 embedder 真实可用时纳入。
+        if self._embedder_available():
+            vec = corpus.vector_search(query, limit=recall_cap)
+            if vec:
+                lists.append(vec)
+
+        if not lists:
+            return []
+        fused = rrf_fuse(lists)
+        fused = _apply_filter(fused, filters)
+        reranked, _ = rerank(query, fused, enabled=rerank_enabled)
+        return reranked[:top_k]
+
+    def _search_actions_hybrid(
+        self,
+        corpus: JsonlCorpus,
+        query: str,
+        filters: dict[str, Any],
+        top_k: int,
+        recall_budget: int,
+        rerank_enabled: bool,
+    ) -> list[dict]:
+        """actions 的融合检索，保留 P0-4 召回预算 + metadata 过滤循环。"""
+        total = len(corpus.records)
+        budget = max(top_k * recall_budget, top_k)
+
+        filtered: list[dict] = []
+        while True:
+            fused = self._hybrid_score_actions(corpus, query, budget)
+            filtered = _apply_filter(fused, filters, action_shape=True)
+            if len(filtered) >= top_k or budget >= total:
+                break
+            budget = min(total, max(budget * 2, budget + 1))
+
+        reranked, _ = rerank(query, filtered, enabled=rerank_enabled)
+        return reranked[:top_k]
+
+    def _hybrid_score_actions(
+        self,
+        corpus: JsonlCorpus,
+        query: str,
+        budget: int,
+    ) -> list[dict]:
+        """对动作语料做多路召回并 RRF 融合，返回前 `budget` 个候选富字段结果。
+
+        召回侧: keyword (富字段) + bm25 (+ 有 embedder 时的 vector)。
+        用动作富字段结果去融合 (id = action_id)，保证后续 metadata 过滤
+        有 risk/status 可用。
+        """
+        lists: list[list[dict]] = []
+
+        kw = self._keyword_actions(corpus, query, budget)
+        if kw:
+            lists.append(kw)
+
+        bm_pairs = self._bm25_rank(corpus, query)[:budget]
+        if bm_pairs:
+            lists.append([self._action_result(corpus, i, s) for s, i in bm_pairs])
+
+        # 仅为避免重复 bm25 (vector 缺依赖降级) 才只叠加一路；embedder 可用
+        # 时 vector 提供独立的语义信号。
+        if self._embedder_available():
+            vec_pairs = self._vector_rank(corpus, query)[:budget]
+            if vec_pairs:
+                lists.append([self._action_result(corpus, i, s) for s, i in vec_pairs])
+
+        if not lists:
+            return []
+        return rrf_fuse(lists)
 
     def _score_actions(
         self,
@@ -409,6 +552,7 @@ class RetrievalService:
         user_request: str,
         limit: int = 5,
         strategy: str = _DEFAULT_STRATEGY,
+        rerank: Optional[bool] = None,
     ) -> dict:
         """完整的 planner 检索流程，保持既有优先级:
 
@@ -417,22 +561,28 @@ class RetrievalService:
           3. 仍无结果 -> 检索手册章节 (sections)
 
         传入的 strategy 会被透传给每一层检索，保证 Planner、API、CLI、
-        MCP 共享同一套可配置检索策略。
+        MCP 共享同一套可配置检索策略。`rerank` 同样透传 (P1-3)，详见
+        `search`。
 
         Returns:
             dict: {query, actions, [procedures], [sections]}
         """
-        actions = self.search(user_request, corpus_type="actions", top_k=limit, strategy=strategy)
+        actions = self.search(
+            user_request, corpus_type="actions", top_k=limit,
+            strategy=strategy, rerank=rerank,
+        )
         result: dict[str, Any] = {"query": user_request, "actions": actions}
 
         if not actions:
             procedures = self.search(
-                user_request, corpus_type="procedures", top_k=limit, strategy=strategy
+                user_request, corpus_type="procedures", top_k=limit,
+                strategy=strategy, rerank=rerank,
             )
             result["procedures"] = procedures
             if not procedures:
                 sections = self.search(
-                    user_request, corpus_type="sections", top_k=limit, strategy=strategy
+                    user_request, corpus_type="sections", top_k=limit,
+                    strategy=strategy, rerank=rerank,
                 )
                 result["sections"] = sections
         else:

@@ -11,9 +11,11 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=8.0"]
-# Optional RAG stack: enables embedding-based retrieval (vector_search) and
-# the LlamaIndex ingestion pipeline (ingest-llama). Absent these, retrieval
-# gracefully falls back to keyword / BM25 and ingestion to a stdlib splitter.
+# Optional RAG stack: enables embedding-based retrieval (vector_search), the
+# cross-encoder reranker (bge-reranker) stage of hybrid search, and the
+# LlamaIndex ingestion pipeline (ingest-llama). Absent these, retrieval
+# gracefully falls back to keyword / BM25 / RRF fusion and ingestion to a
+# stdlib splitter.
 rag = [
     "llama-index-core>=0.10.0",
     "llama-index-embeddings-huggingface>=0.1.0",

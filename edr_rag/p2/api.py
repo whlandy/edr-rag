@@ -51,6 +51,7 @@ class EdrRagAPI:
         status_filter: Optional[str] = None,
         strategy: str = "keyword",
         recall_budget: int = 4,
+        rerank: Optional[bool] = None,
     ) -> list[dict]:
         """Search the action catalog (delegated to RetrievalService).
 
@@ -59,6 +60,9 @@ class EdrRagAPI:
         recall_budget (P0-4): 召回预算倍数。先按 top_k*recall_budget 扩大
         候选池打分排序，再对候选池做 risk/status metadata 过滤，结果不足时
         循环扩大候选池直到满足或耗尽语料；避免严格过滤器导致漏召回。
+
+        rerank (P1-3): cross-encoder 精排开关，仅对 hybrid 生效；None 跟随
+        全局默认 (可选依赖可用即启用)。
         """
         filters = {}
         if risk_filter:
@@ -72,6 +76,7 @@ class EdrRagAPI:
             filters=filters,
             top_k=limit,
             recall_budget=recall_budget,
+            rerank=rerank,
         )
 
     def get_action(self, action_id: str) -> Optional[dict]:
@@ -89,12 +94,15 @@ class EdrRagAPI:
         limit: int = 5,
         scoring: Optional[str] = None,
         strategy: Optional[str] = None,
+        rerank: Optional[bool] = None,
     ) -> list[dict]:
         """Search P1 procedures (fallback if action_search has no results).
 
         strategy: 'keyword' | 'bm25' | 'vector' | 'hybrid' (default 'keyword').
         `scoring` 为历史别名参数，与 `strategy` 等价；两者都传时以
         `strategy` 为准（保持 backward compatibility）。
+
+        rerank (P1-3): cross-encoder 精排开关，仅对 hybrid 生效。
         """
         if strategy is None:
             strategy = scoring or "keyword"
@@ -103,6 +111,7 @@ class EdrRagAPI:
             corpus_type="procedures",
             strategy=strategy,
             top_k=limit,
+            rerank=rerank,
         )
 
     # ---------- Manual search (last priority) ----------
@@ -113,12 +122,15 @@ class EdrRagAPI:
         limit: int = 5,
         scoring: Optional[str] = None,
         strategy: Optional[str] = None,
+        rerank: Optional[bool] = None,
     ) -> list[dict]:
         """Search P0 sections (for explanation or troubleshooting only).
 
         strategy: 'keyword' | 'bm25' | 'vector' | 'hybrid' (default 'keyword').
         `scoring` 为历史别名参数，与 `strategy` 等价；两者都传时以
         `strategy` 为准。
+
+        rerank (P1-3): cross-encoder 精排开关，仅对 hybrid 生效。
         """
         if strategy is None:
             strategy = scoring or "keyword"
@@ -127,6 +139,7 @@ class EdrRagAPI:
             corpus_type="sections",
             strategy=strategy,
             top_k=limit,
+            rerank=rerank,
         )
 
     # ---------- Planner orchestration ----------
@@ -136,10 +149,14 @@ class EdrRagAPI:
         user_request: str,
         limit: int = 5,
         strategy: str = "keyword",
+        rerank: Optional[bool] = None,
     ) -> dict:
         """Orchestrate the full planner retrieval flow (action → procedure → manual).
 
         Delegates to RetrievalService.planner_retrieve which preserves the
         §6 priority order and threads `strategy` to each retrieval tier.
+        `rerank` (P1-3) is likewise threaded through.
         """
-        return self._service.planner_retrieve(user_request, limit=limit, strategy=strategy)
+        return self._service.planner_retrieve(
+            user_request, limit=limit, strategy=strategy, rerank=rerank
+        )

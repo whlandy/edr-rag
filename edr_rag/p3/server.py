@@ -73,33 +73,53 @@ class EdrRagAgent:
 
     # ----- Knowledge search tools -----
 
-    def search_sections(self, query: str, limit: int = 5, strategy: str = "keyword") -> list[dict]:
+    def search_sections(self, query: str, limit: int = 5, strategy: str = "keyword",
+                        rerank: Optional[bool] = None) -> list[dict]:
         """Search P0 sections.jsonl (via RetrievalService).
 
         strategy: 'keyword' | 'bm25' | 'vector' | 'hybrid' (default 'keyword').
+        rerank (P1-3): cross-encoder 精排开关，仅对 hybrid 生效。
         """
-        return self.retrieval.search(query, corpus_type="sections", top_k=limit, strategy=strategy)
+        return self.retrieval.search(
+            query, corpus_type="sections", top_k=limit,
+            strategy=strategy, rerank=rerank,
+        )
 
-    def search_procedures(self, query: str, limit: int = 5, strategy: str = "keyword") -> list[dict]:
+    def search_procedures(self, query: str, limit: int = 5, strategy: str = "keyword",
+                          rerank: Optional[bool] = None) -> list[dict]:
         """Search P1 procedures.jsonl (via RetrievalService).
 
         strategy: 'keyword' | 'bm25' | 'vector' | 'hybrid' (default 'keyword').
+        rerank (P1-3): cross-encoder 精排开关，仅对 hybrid 生效。
         """
-        return self.retrieval.search(query, corpus_type="procedures", top_k=limit, strategy=strategy)
+        return self.retrieval.search(
+            query, corpus_type="procedures", top_k=limit,
+            strategy=strategy, rerank=rerank,
+        )
 
-    def search_actions(self, query: str, limit: int = 5, strategy: str = "keyword") -> list[dict]:
+    def search_actions(self, query: str, limit: int = 5, strategy: str = "keyword",
+                       rerank: Optional[bool] = None) -> list[dict]:
         """Search P2 actions.jsonl (rich action result, via RetrievalService).
 
         strategy: 'keyword' | 'bm25' | 'vector' | 'hybrid' (default 'keyword').
+        rerank (P1-3): cross-encoder 精排开关，仅对 hybrid 生效。
         """
-        return self.retrieval.search(query, corpus_type="actions", top_k=limit, strategy=strategy)
+        return self.retrieval.search(
+            query, corpus_type="actions", top_k=limit,
+            strategy=strategy, rerank=rerank,
+        )
 
-    def search_chunks(self, query: str, limit: int = 5, strategy: str = "keyword") -> list[dict]:
+    def search_chunks(self, query: str, limit: int = 5, strategy: str = "keyword",
+                      rerank: Optional[bool] = None) -> list[dict]:
         """Search P1 chunks.jsonl (via RetrievalService).
 
         strategy: 'keyword' | 'bm25' | 'vector' | 'hybrid' (default 'keyword').
+        rerank (P1-3): cross-encoder 精排开关，仅对 hybrid 生效。
         """
-        return self.retrieval.search(query, corpus_type="chunks", top_k=limit, strategy=strategy)
+        return self.retrieval.search(
+            query, corpus_type="chunks", top_k=limit,
+            strategy=strategy, rerank=rerank,
+        )
 
     def get_action(self, action_id: str) -> Optional[dict]:
         """Retrieve a specific action by action_id."""
@@ -248,6 +268,20 @@ def create_mcp_server(workdir: str) -> Server:
         "enum": ["keyword", "bm25", "vector", "hybrid"],
         "default": "keyword",
     }
+    # shared cross-encoder rerank property (P1-3), only meaningful for hybrid.
+    _RERANK_PROP = {
+        "type": "string",
+        "description": ("Cross-encoder rerank toggle for hybrid: auto (default, enable when "
+                        "optional RAG deps available, else skip) | on | off."),
+        "enum": ["auto", "on", "off"],
+        "default": "auto",
+    }
+
+    def _rerank_arg(value) -> Optional[bool]:
+        """把工具的 rerank (auto/on/off) 映射为 service 的 Optional[bool]。"""
+        if not value or value == "auto":
+            return None
+        return value == "on"
 
     @app.list_tools()
     async def handle_list_tools():
@@ -261,6 +295,7 @@ def create_mcp_server(workdir: str) -> Server:
                         "query": {"type": "string", "description": "Search query (CJK-safe, keyword based)"},
                         "limit": {"type": "integer", "description": "Max results", "default": 5},
                         "strategy": _STRATEGY_PROP,
+                        "rerank": _RERANK_PROP,
                     },
                     "required": ["query"],
                 },
@@ -274,6 +309,7 @@ def create_mcp_server(workdir: str) -> Server:
                         "query": {"type": "string", "description": "Search query (CJK-safe)"},
                         "limit": {"type": "integer", "description": "Max results", "default": 5},
                         "strategy": _STRATEGY_PROP,
+                        "rerank": _RERANK_PROP,
                     },
                     "required": ["query"],
                 },
@@ -287,6 +323,7 @@ def create_mcp_server(workdir: str) -> Server:
                         "query": {"type": "string", "description": "Search query (CJK-safe)"},
                         "limit": {"type": "integer", "description": "Max results", "default": 5},
                         "strategy": _STRATEGY_PROP,
+                        "rerank": _RERANK_PROP,
                     },
                     "required": ["query"],
                 },
@@ -389,11 +426,11 @@ def create_mcp_server(workdir: str) -> Server:
     async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         try:
             if name == "search_knowledge":
-                results = agent.search_sections(arguments["query"], arguments.get("limit", 5), strategy=arguments.get("strategy", "keyword"))
+                results = agent.search_sections(arguments["query"], arguments.get("limit", 5), strategy=arguments.get("strategy", "keyword"), rerank=_rerank_arg(arguments.get("rerank")))
             elif name == "search_procedures":
-                results = agent.search_procedures(arguments["query"], arguments.get("limit", 5), strategy=arguments.get("strategy", "keyword"))
+                results = agent.search_procedures(arguments["query"], arguments.get("limit", 5), strategy=arguments.get("strategy", "keyword"), rerank=_rerank_arg(arguments.get("rerank")))
             elif name == "search_actions":
-                results = agent.search_actions(arguments["query"], arguments.get("limit", 5), strategy=arguments.get("strategy", "keyword"))
+                results = agent.search_actions(arguments["query"], arguments.get("limit", 5), strategy=arguments.get("strategy", "keyword"), rerank=_rerank_arg(arguments.get("rerank")))
             elif name == "get_action":
                 result = agent.get_action(arguments["action_id"])
                 results = result if result else {"error": "not found"}
