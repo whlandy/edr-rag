@@ -151,7 +151,8 @@ def _cli_answer(args: argparse.Namespace):
 
     api = EdrRagAPI(args.workdir)
     result = api.synthesize(
-        args.query, limit=args.limit, strategy=args.strategy
+        args.query, limit=args.limit, strategy=args.strategy,
+        min_confidence=args.min_confidence,
     )
     if args.json:
         import json as _json
@@ -162,7 +163,8 @@ def _cli_answer(args: argparse.Namespace):
     print(answer_to_text(SynthesizedAnswer(**result)))
     print()
     print(f"[generated_by={result['generated_by']} confidence={result['confidence']} "
-          f"requires_confirmation={str(result['requires_confirmation']).lower()}]")
+          f"requires_confirmation={str(result['requires_confirmation']).lower()} "
+          f"answer_status={result['answer_status']}]")
 
 
 def main():
@@ -231,6 +233,8 @@ def main():
                                help="Retrieval strategy (default: keyword)")
     answer_parser.add_argument("--json", action="store_true",
                                help="Emit the full structured answer as JSON")
+    answer_parser.add_argument("--min-confidence", type=float, default=None,
+                               help="证据不足拒答的置信度阈值 (P2-3, 默认 0.4)")
 
     args = parser.parse_args()
     if not args.subcommand:

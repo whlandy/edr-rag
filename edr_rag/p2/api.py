@@ -212,6 +212,7 @@ class EdrRagAPI:
         llm: Optional[Callable] = None,
         limit: int = 5,
         strategy: str = "keyword",
+        min_confidence: Optional[float] = None,
     ) -> dict:
         """基于检索上下文生成结构化答案（P2-1）。
 
@@ -222,13 +223,18 @@ class EdrRagAPI:
             llm: 可选的可调用对象 `(user_request, context_text) -> str`，
                 用于生成自然语言 answer；缺省回落为结构化组装（主链路不报错）。
             limit / strategy: 自动检索时的检索参数。
+            min_confidence: 证据不足拒答的置信度阈值（P2-3）。为 None 时使用
+                模块默认 CONFIDENCE_REFUSE_THRESHOLD。
 
         Returns:
             SynthesizedAnswer.to_jsonl() 的 dict:
             {answer, steps, warnings, warning_sources, assertions, preconditions,
-             citations, confidence, requires_confirmation, generated_by}。
+             citations, confidence, requires_confirmation, generated_by,
+             answer_status, refusal_reason, conflicts}。
             P2-2: 每个 step 含 source；warning_sources 与 warnings 一一对应；
             assertions 为带 source 的断言列表，均可追溯到 artifacts。
+            P2-3: answer_status 为 answered / refused / conflict；refused 时
+            不编造，conflict 时标注冲突并置 requires_confirmation=True。
         """
         from .synthesize import synthesize_answer
 
@@ -239,7 +245,9 @@ class EdrRagAPI:
         # 检索返回的动作结果是薄形状（无 procedure/preconditions/recovery），
         # 用全量动作记录补全，让合成器能输出完整步骤/前置条件/注意事项。
         context = _enrich_action_details(self._service, context)
-        return synthesize_answer(user_request, context, llm=llm).to_jsonl()
+        return synthesize_answer(
+            user_request, context, llm=llm, min_confidence=min_confidence
+        ).to_jsonl()
 
 
 def _enrich_action_details(service, context: dict) -> dict:

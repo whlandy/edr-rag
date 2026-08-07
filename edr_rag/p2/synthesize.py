@@ -4,6 +4,14 @@ P2-2 逐条引用来源：答案的每个 steps / warnings / assertions 都携�
 （source file / section_id / procedure_id），可追溯到 artifacts
 （sections.jsonl / procedures.jsonl / actions.jsonl）。
 
+P2-3 证据不足拒答 + 冲突处理：
+  - 置信度低于阈值或证据不足时明确拒答（不编造）：
+    SynthesizedAnswer.answer_status == 'refused'，refusal_reason 说明原因
+    （insufficient_evidence / low_confidence）。
+  - 检测到冲突文档时标注冲突并请求澄清：
+    answer_status == 'conflict'，conflicts 列出各冲突（类型/描述/来源），
+    并置 requires_confirmation=True（需澄清后再执行）。
+
 设计 (§6, Answer Synthesis):
   检索(planner_retrieve / action_search / procedure_search)返回结构化上下文后，
   需要把它组织成最终呈递给用户/规划器的答案。本模块负责「答案生成」：
@@ -28,6 +36,9 @@ P2-2 逐条引用来源：答案的每个 steps / warnings / assertions 都携�
                           title、score），供整体溯源。
   - confidence:           float 综合置信度。
   - requires_confirmation:bool 是否需要人工确认。
+  - answer_status:        str  答案状态（P2-3）：answered / refused / conflict。
+  - refusal_reason:       Optional[str] 拒答原因（P2-3）。
+  - conflicts:            list[dict] 冲突列表（P2-3），每条含 type/description/sources。
 
 LLM 可选（设计要点）:
   - `llm` 是一个可调用对象，签名 `callable(user_request, context_text) -> str`，
@@ -35,6 +46,7 @@ LLM 可选（设计要点）:
     `_assemble_answer` 基于结构化字段组装。
   - 本模块不引入任何新的运行时必需依赖：LLM 仅是可选的注入函数。
   - 缺依赖时永不报错——组装路径是纯 stdlib 的确定性逻辑。
+  - 拒答/冲突状态与 answer 文本由确定性逻辑计算，LLM 出现与否都不改变状态判定。
 
 输入 context 兼容两种形状（向前兼容现有检索入口）:
   1. planner_retrieve 的 dict:  {query, actions:[...], procedures:[...], sections:[...]}
@@ -51,6 +63,30 @@ from typing import Any, Callable, Optional
 #: 允许的 answer 生成模式（供 CLI 展示）。
 ASSEMBLE_MODE = "assemble"
 LLM_MODE = "llm"
+
+#: 答案状态（P2-3）：
+#:   answered — 正常作答；refused — 证据不足/置信度过低，明确拒答（不编造）；
+#:   conflict — 检测到冲突文档，标注冲突并请求澄清。
+ANSWER_ANSWERED = "answered"
+ANSWER_REFUSED = "refused"
+ANSWER_CONFLICT = "conflict"
+
+#: 证据不足拒答阈值：当没有足够命中条目，或综合置信度低于该值时，拒答而非编造。
+CONFIDENCE_REFUSE_THRESHOLD = 0.4
+
+#: 互斥操作对（同一目标出现相反操作 → 冲突）。
+_OPPOSITE_OPERATIONS: tuple[tuple[str, str], ...] = (
+    ("enable", "disable"),
+    ("启用", "禁用"),
+    ("start", "stop"),
+    ("启动", "停止"),
+    ("open", "close"),
+    ("打开", "关闭"),
+    ("allow", "block"),
+    ("放行", "阻断"),
+    ("install", "uninstall"),
+    ("安装", "卸载"),
+)
 
 
 @dataclass
@@ -77,6 +113,10 @@ class SynthesizedAnswer:
     confidence: float = 0.0
     requires_confirmation: bool = False
     generated_by: str = ASSEMBLE_MODE
+    # P2-3: 答案状态 / 拒答原因 / 冲突列表
+    answer_status: str = ANSWER_ANSWERED
+    refusal_reason: Optional[str] = None
+    conflicts: list[dict] = field(default_factory=list)
 
     def to_jsonl(self) -> dict:
         return asdict(self)
@@ -293,24 +333,195 @@ def _compute_requires_confirmation(context: dict) -> bool:
     return False
 
 
+# ---------- 证据充分性 & 冲突检测 (P2-3) ----------
+
+
+def _has_primary_evidence(ctx: dict) -> bool:
+    """是否有可作为依据的命中条目（动作/流程）。"""
+    return bool(ctx.get("actions") or ctx.get("procedures"))
+
+
+def _evidence_refusal_reason(
+    ctx: dict, confidence: float, threshold: float = CONFIDENCE_REFUSE_THRESHOLD
+) -> Optional[str]:
+    """判断是否证据不足需要拒答，返回拒答原因；可作答返回 None。
+
+    规则（P2-3）：
+      - 无任何 action/procedure 命中 → insufficient_evidence（不编造）。
+      - 有命中但综合置信度低于 threshold → low_confidence。
+    """
+    if not _has_primary_evidence(ctx):
+        return "insufficient_evidence"
+    if confidence < threshold:
+        return "low_confidence"
+    return None
+
+
+def _op_canonical(op: str) -> str:
+    """把操作字符串归一化为小写，便于比较。"""
+    return op.strip().lower()
+
+
+def _is_opposite(op1: str, op2: str) -> bool:
+    """判断两个操作是否互为反向（互斥）。"""
+    op1, op2 = _op_canonical(op1), _op_canonical(op2)
+    if not op1 or not op2:
+        return False
+    for a, b in _OPPOSITE_OPERATIONS:
+        if (op1 == a and op2 == b) or (op1 == b and op2 == a):
+            return True
+    return False
+
+
+def _detect_conflicts(ctx: dict) -> list[dict]:
+    """检测检索到的文档/动作之间的冲突（P2-3）。
+
+    启发式（确定性、纯 stdlib，无外部依赖）：
+      1. 互斥操作：同一目标(target)同时出现相反的操作（启用/禁用、打开/关闭等）。
+      2. 步骤级冲突：同一 step order 的同一操作动作，目标(target)不一致。
+      3. 风险矛盾：同一标题/操作在不同来源里的风险等级差异过大（low vs high）。
+
+    Returns:
+        list[dict]，每条含 type / description / sources（涉及来源引用列表）。
+        无冲突返回 []。
+    """
+    conflicts: list[dict] = []
+    items: list[dict] = list(ctx.get("actions") or []) + list(ctx.get("procedures") or [])
+    if len(items) < 2:
+        return conflicts
+
+    # 1) 互斥操作：target -> [(op, source_ref)]
+    target_ops: dict[str, list[tuple[str, dict]]] = {}
+    # 2) 步骤级冲突：(order, op) -> [(target, source_ref)]
+    step_targets: dict[tuple[int, str], list[tuple[str, dict]]] = {}
+    # 3) 风险矛盾：title -> [(risk, source_ref)]
+    title_risks: dict[str, list[tuple[str, dict]]] = {}
+
+    for it in items:
+        src = _resolve_source(it)
+        title = str(it.get("title") or "").strip() or str(it.get("id") or "").strip()
+        if title:
+            title_risks.setdefault(title, []).append((str(it.get("risk") or ""), dict(src)))
+        for s in it.get("procedure") or []:
+            if not isinstance(s, dict):
+                continue
+            op = str(s.get("action") or "").strip()
+            tgt = str(s.get("target") or "").strip()
+            order = s.get("order")
+            if tgt and op:
+                target_ops.setdefault(tgt, []).append((op, dict(src)))
+            if order is not None and op:
+                step_targets.setdefault((int(order), _op_canonical(op)), []).append((tgt, dict(src)))
+
+    # 互斥操作检测：对每个目标，检查是否存在相反操作对
+    ops_by_target: dict[str, set[str]] = {
+        tgt: {_op_canonical(op) for op, _ in pairs}
+        for tgt, pairs in target_ops.items()
+    }
+    for tgt, ops in ops_by_target.items():
+        op_list = list(ops)
+        for i in range(len(op_list)):
+            for j in range(i + 1, len(op_list)):
+                if _is_opposite(op_list[i], op_list[j]):
+                    sources = [src for op, src in target_ops[tgt]
+                               if _op_canonical(op) in (op_list[i], op_list[j])]
+                    conflicts.append({
+                        "type": "opposite_operations",
+                        "description": f"目标「{tgt}」出现互斥操作：{op_list[i]} 与 {op_list[j]}，操作互相冲突。",
+                        "sources": sources,
+                    })
+
+    # 步骤级冲突：同一 (order, action) 出现多个不同 target
+    for (order, op), pairs in step_targets.items():
+        distinct_targets = {t for t, _ in pairs if t}
+        if len(distinct_targets) > 1:
+            sources = [src for _, src in pairs]
+            conflicts.append({
+                "type": "step_conflict",
+                "description": (
+                    f"第 {order} 步操作「{op}」在不同文档中的目标不一致："
+                    + "、".join(sorted(distinct_targets))
+                ),
+                "sources": sources,
+            })
+
+    # 风险矛盾：同一标题出现 low 与 high 两种风险
+    for title, risks in title_risks.items():
+        levels = {r for r, _ in risks if r in ("low", "high")}
+        if {"low", "high"} <= levels:
+            sources = [src for _, src in risks]
+            conflicts.append({
+                "type": "risk_contradiction",
+                "description": f"操作「{title}」在不同来源中的风险等级矛盾（low vs high）。",
+                "sources": sources,
+            })
+
+    return conflicts
+
+
+def _assemble_refusal(user_request: str, reason: str) -> str:
+    """生成明确的拒答文本（P2-3）——不编造，提示证据不足。"""
+    if reason == "low_confidence":
+        return (
+            f"关于「{user_request}」，检索到的相关资料的置信度过低，"
+            f"无法据此给出可靠操作步骤。为避免误导，暂不提供具体步骤。"
+            f"请尝试更换更明确的关键词，或查阅完整手册后重试。"
+        )
+    return (
+        f"未检索到与「{user_request}」明确匹配的操作步骤（证据不足）。"
+        f"为避免编造，暂不给出具体操作。请更换关键词重试，"
+        f"或直接查阅完整手册相关章节。"
+    )
+
+
+def _assemble_conflict(user_request: str, steps: list[dict], conflicts: list[dict]) -> str:
+    """生成冲突提示文本（P2-3）——标注冲突并请求澄清。"""
+    lines = [f"针对「{user_request}」，检索到相互冲突的文档，无法直接给出唯一操作步骤。"]
+    lines.append("")
+    lines.append("检测到以下冲突：")
+    for i, c in enumerate(conflicts, 1):
+        lines.append(f"  {i}. {c['description']}")
+    lines.append("")
+    lines.append("请在以下选项中选择以澄清：")
+    if steps:
+        # 列出第一组步骤作为候选
+        lines.append("  a. 按检索到的步骤执行（见下方操作步骤）")
+    lines.append("  b. 提供更具体的场景/产品版本，以便重新检索")
+    return "\n".join(lines)
+
+
 # ---------- answer 组装（无 LLM 路径） ----------
 
 
-def _assemble_answer(user_request: str, context: dict, steps: list[dict],
-                     warnings: list[str], preconditions: list[str]) -> str:
+def _assemble_answer(
+    *,
+    user_request: str,
+    context: dict,
+    steps: list[dict],
+    warnings: list[str],
+    preconditions: list[str],
+    conflicts: list[dict],
+    answer_status: str,
+    refusal_reason: Optional[str],
+) -> str:
     """基于结构化字段组装自然语言 answer（无 LLM 时的确定性路径）。
 
-    组装策略：
+    组装策略（P2-3）：
+      - answer_status == 'refused' -> 明确拒答文本（不编造）。
+      - answer_status == 'conflict' -> 标注冲突并请求澄清。
       - 有动作/流程命中 -> 标题 + 分步操作步骤（含前置条件与注意事项）。
-      - 无命中 -> 明确的「未找到明确操作步骤」提示。
+      - 无命中（证据不足）-> 明确的「未检索到 / 证据不足」拒答提示。
     保证输出可读、可呈递、可审计。
     """
-    lines: list[str] = []
-    actions = context.get("actions") or []
-    procedures = context.get("procedures") or []
-    sections = context.get("sections") or []
+    if answer_status == ANSWER_REFUSED:
+        return _assemble_refusal(user_request, refusal_reason or "insufficient_evidence")
 
-    primary = actions or procedures
+    if answer_status == ANSWER_CONFLICT:
+        return _assemble_conflict(user_request, steps, conflicts)
+
+    lines: list[str] = []
+    primary = context.get("actions") or context.get("procedures") or []
+
     pre = "、".join(preconditions)
 
     if primary:
@@ -332,7 +543,7 @@ def _assemble_answer(user_request: str, context: dict, steps: list[dict],
             for w in warnings:
                 lines.append(f"  - {w}")
         # 补充流程/章节的补充说明（若有）
-        extra = [x.get("title", "") for x in (procedures or sections) if x.get("title", "")]
+        extra = [x.get("title", "") for x in (context.get("procedures") or context.get("sections") or []) if x.get("title", "")]
         if extra:
             lines.append("")
             lines.append("相关参考：" + "；".join(extra))
@@ -349,6 +560,7 @@ def synthesize_answer(
     user_request: str,
     context: Any,
     llm: Optional[Callable[[str, str], str]] = None,
+    min_confidence: Optional[float] = None,
 ) -> SynthesizedAnswer:
     """输入检索上下文，输出结构化答案（P2-1）。
 
@@ -359,6 +571,9 @@ def synthesize_answer(
         llm: 可选的可调用对象 `(user_request, context_text) -> str`，
             用于生成自然语言 answer。为 None 时回落为组装模式（保证
             无 LLM 时主链路可用）。调用异常会被捕获并回落到组装模式。
+        min_confidence: 证据不足拒答的置信度阈值（P2-3）。为 None 时使用
+            模块默认 CONFIDENCE_REFUSE_THRESHOLD。低于该阈值或证据不足
+            时明确拒答（answer_status='refused'），不编造。
 
     Returns:
         SynthesizedAnswer（结构化结果）。
@@ -414,6 +629,20 @@ def synthesize_answer(
     confidence = _compute_confidence(ctx)
     requires_confirmation = _compute_requires_confirmation(ctx)
 
+    # P2-3: 证据充分性 + 冲突检测
+    threshold = CONFIDENCE_REFUSE_THRESHOLD if min_confidence is None else float(min_confidence)
+    refusal_reason = _evidence_refusal_reason(ctx, confidence, threshold) if threshold > 0 else None
+    conflicts = _detect_conflicts(ctx) if refusal_reason is None else []
+
+    if conflicts:
+        answer_status = ANSWER_CONFLICT
+        # 冲突需要用户澄清，视为需要确认
+        requires_confirmation = True
+    elif refusal_reason is not None:
+        answer_status = ANSWER_REFUSED
+    else:
+        answer_status = ANSWER_ANSWERED
+
     generated_by = ASSEMBLE_MODE
     answer = ""
 
@@ -429,7 +658,14 @@ def synthesize_answer(
 
     if not answer:
         answer = _assemble_answer(
-            user_request, ctx, unique_steps, uniq_warnings, uniq_pre
+            user_request=user_request,
+            context=ctx,
+            steps=unique_steps,
+            warnings=uniq_warnings,
+            preconditions=uniq_pre,
+            conflicts=conflicts,
+            answer_status=answer_status,
+            refusal_reason=refusal_reason,
         )
 
     return SynthesizedAnswer(
@@ -443,6 +679,9 @@ def synthesize_answer(
         confidence=confidence,
         requires_confirmation=requires_confirmation,
         generated_by=generated_by,
+        answer_status=answer_status,
+        refusal_reason=refusal_reason,
+        conflicts=conflicts,
     )
 
 
@@ -490,9 +729,21 @@ def answer_to_text(answer: SynthesizedAnswer) -> str:
     """把结构化答案渲染成纯文本（CLI/展示用）。
 
     输出含 answer 正文 + 逐条来源（steps/warnings/assertions）+ 引用列表，
-    方便终端呈现与溯源性展示。
+    方便终端呈现与溯源性展示。拒答与冲突状态也会附加标注（P2-3）。
     """
     out = [answer.answer]
+
+    # P2-3: 状态标注（拒答 / 冲突）
+    if answer.answer_status == ANSWER_REFUSED:
+        out.append("")
+        out.append("[状态：证据不足，已拒答（不编造）]")
+    elif answer.answer_status == ANSWER_CONFLICT:
+        out.append("")
+        out.append("[状态：文档冲突，需澄清后再执行]")
+        for i, c in enumerate(answer.conflicts, 1):
+            refs = [r for r in c.get("sources", []) if _render_source_ref(r)]
+            suffix = f"  [来源: {'、'.join(_render_source_ref(r) for r in refs)}]" if refs else ""
+            out.append(f"  冲突{i}：{c.get('description', '')}{suffix}")
 
     if answer.steps:
         out.append("")
