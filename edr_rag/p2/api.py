@@ -10,17 +10,19 @@ Design (§6, Planner Retrieval Flow):
 
 All search functions return results as dicts (JSON-serializable), so they
 can be passed directly to the planner or over MCP.
+
+Since P0-2, this API is a thin, backward-compatible wrapper over the unified
+RetrievalService (edr_rag/retrieval.py) — it no longer touches JSONL /
+JsonlCorpus directly; all retrieval is delegated to the service so pure-API,
+CLI, and MCP share one code path.
 """
 
 from __future__ import annotations
 
-import json
-import re
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
-from .extract_actions import build_actions_from_file
-from ..p1.search import JsonlCorpus, tokenize
+from ..retrieval import RetrievalService
 
 
 class EdrRagAPI:
@@ -31,52 +33,13 @@ class EdrRagAPI:
       - get_action: get full action entry by id
       - procedure_search: search P1 procedures (fallback)
       - manual_search: search P0 sections (troubleshooting only)
+
+    All operations delegate to a shared RetrievalService instance.
     """
 
     def __init__(self, workdir: str | Path):
         self.workdir = Path(workdir)
-
-        # Lazy-loaded corpora
-        self._actions: list[dict] | None = None
-        self._procedures_corpus: JsonlCorpus | None = None
-        self._sections_corpus: JsonlCorpus | None = None
-
-    # ---------- Corpora loading (lazy) ----------
-
-    def _load_actions(self) -> list[dict]:
-        if self._actions is not None:
-            return self._actions
-        path = self.workdir / "actions.jsonl"
-        if not path.exists():
-            self._actions = []
-            return self._actions
-        records = []
-        with path.open(encoding="utf-8") as f:
-            for line in f:
-                if line.strip():
-                    records.append(json.loads(line))
-        self._actions = records
-        return records
-
-    def _load_procedure_corpus(self) -> JsonlCorpus | None:
-        if self._procedures_corpus is not None:
-            return self._procedures_corpus
-        path = self.workdir / "procedures.jsonl"
-        if not path.exists():
-            self._procedures_corpus = JsonlCorpus([])
-            return None
-        self._procedures_corpus = JsonlCorpus.from_file(path)
-        return self._procedures_corpus
-
-    def _load_section_corpus(self) -> JsonlCorpus | None:
-        if self._sections_corpus is not None:
-            return self._sections_corpus
-        path = self.workdir / "sections.jsonl"
-        if not path.exists():
-            self._sections_corpus = JsonlCorpus([])
-            return None
-        self._sections_corpus = JsonlCorpus.from_file(path)
-        return self._sections_corpus
+        self._service = RetrievalService(self.workdir)
 
     # ---------- Action search (first priority) ----------
 
@@ -87,101 +50,26 @@ class EdrRagAPI:
         risk_filter: Optional[str] = None,
         status_filter: Optional[str] = None,
     ) -> list[dict]:
-        """Search the action catalog.
-
-        Matches against action_id, title, module, preconditions, and
-        procedure step instructions.
-
-        Args:
-            query: Free-text search query (supports CJK).
-            limit: Max results to return.
-            risk_filter: Optional filter: 'low', 'medium', 'high'.
-            status_filter: Optional filter: 'candidate', 'needs_review',
-                          'approved', 'published'.
-
-        Returns:
-            List of result dicts with id, title, risk, status, snippet.
-        """
-        actions = self._load_actions()
-        if not actions:
-            return []
-
-        query_tokens = set(tokenize(query))
-        if not query_tokens:
-            return []
-
-        scored = []
-        for action in actions:
-            # Build searchable text
-            searchable = " \n".join([
-                action.get("action_id", ""),
-                action.get("title", ""),
-                action.get("module", ""),
-                action.get("version", "") or "",
-                " ".join(action.get("preconditions", [])),
-                " ".join(s.get("source_instruction", "") for s in action.get("procedure", [])),
-                " ".join(action.get("success_criteria", [])),
-                " ".join(action.get("recovery", [])),
-            ])
-
-            score = 0.0
-            for t in query_tokens:
-                if t in searchable:
-                    # Title and action_id matches weighted higher
-                    weight = 3.0 if (t in action.get("title", "") or t in action.get("action_id", "")) else 1.0
-                    score += searchable.count(t) * weight
-
-            if score > 0:
-                # Apply filters
-                if risk_filter and action.get("risk") != risk_filter:
-                    continue
-                if status_filter and action.get("status") != status_filter:
-                    continue
-                scored.append((score, action))
-
-        scored.sort(key=lambda x: -x[0])
-
-        results = []
-        for score, action in scored[:limit]:
-            snippet = action.get("title", "")
-            pre = action.get("preconditions", [])
-            if pre:
-                snippet += " | 前置条件: " + "；".join(pre)
-            results.append({
-                "id": action.get("action_id", ""),
-                "title": action.get("title", ""),
-                "risk": action.get("risk", ""),
-                "status": action.get("status", ""),
-                "confidence": action.get("confidence", 0.0),
-                "score": round(score, 3),
-                "snippet": snippet,
-            })
-
-        return results
+        """Search the action catalog (delegated to RetrievalService)."""
+        filters = {}
+        if risk_filter:
+            filters["risk"] = risk_filter
+        if status_filter:
+            filters["status"] = status_filter
+        return self._service.search(
+            query,
+            corpus_type="actions",
+            strategy="keyword",
+            filters=filters,
+            top_k=limit,
+        )
 
     def get_action(self, action_id: str) -> Optional[dict]:
         """Get the full action catalog entry by action_id (stripped).
 
-        Matches against action_id (e.g. 'network.configure_proxy'
-        or 'procedure.network.configure_proxy' — both work).
+        Handles 'action.' / 'procedure.' prefixes via the service's get.
         """
-        actions = self._load_actions()
-        if not actions:
-            return None
-
-        # Normalize lookup key: strip 'action.' prefix if present
-        lookup = action_id
-        for prefix in ("action.", "procedure."):
-            if lookup.startswith(prefix):
-                lookup = lookup[len(prefix):]
-                break
-
-        for action in actions:
-            aid = action.get("action_id", "")
-            if aid == lookup:
-                return action
-
-        return None
+        return self._service.get("actions", action_id, key_field="action_id")
 
     # ---------- Procedure search (second priority) ----------
 
@@ -191,23 +79,13 @@ class EdrRagAPI:
         limit: int = 5,
         scoring: str = "keyword",
     ) -> list[dict]:
-        """Search P1 procedures (fallback if action_search has no results).
-
-        Args:
-            query: Search query string.
-            limit: Max results.
-            scoring: 'keyword' or 'bm25'.
-
-        Returns:
-            List of result dicts with id, title, snippet, source.
-        """
-        corpus = self._load_procedure_corpus()
-        if not corpus:
-            return []
-
-        if scoring == "bm25":
-            return corpus.bm25_search(query, limit=limit)
-        return corpus.keyword_search(query, limit=limit)
+        """Search P1 procedures (fallback if action_search has no results)."""
+        return self._service.search(
+            query,
+            corpus_type="procedures",
+            strategy=scoring,
+            top_k=limit,
+        )
 
     # ---------- Manual search (last priority) ----------
 
@@ -217,23 +95,13 @@ class EdrRagAPI:
         limit: int = 5,
         scoring: str = "keyword",
     ) -> list[dict]:
-        """Search P0 sections (for explanation or troubleshooting only).
-
-        Args:
-            query: Search query string.
-            limit: Max results.
-            scoring: 'keyword' or 'bm25'.
-
-        Returns:
-            List of result dicts with id, title, snippet, source.
-        """
-        corpus = self._load_section_corpus()
-        if not corpus:
-            return []
-
-        if scoring == "bm25":
-            return corpus.bm25_search(query, limit=limit)
-        return corpus.keyword_search(query, limit=limit)
+        """Search P0 sections (for explanation or troubleshooting only)."""
+        return self._service.search(
+            query,
+            corpus_type="sections",
+            strategy=scoring,
+            top_k=limit,
+        )
 
     # ---------- Planner orchestration ----------
 
@@ -242,36 +110,9 @@ class EdrRagAPI:
         user_request: str,
         limit: int = 5,
     ) -> dict:
-        """Orchestrate the full planner retrieval flow.
+        """Orchestrate the full planner retrieval flow (action → procedure → manual).
 
-        Implements design §6 planner retrieval order:
-          1. Search action catalog first.
-          2. If no actions found, search procedures.
-          3. Only fall back to manual sections for explanation.
-
-        Returns:
-            dict with:
-              - query: original query
-              - actions: list of action search results
-              - procedures: list of procedure search results (if actions empty)
-              - sections: list of section search results (only if both empty)
+        Delegates to RetrievalService.planner_retrieve which preserves the
+        §6 priority order.
         """
-        actions = self.action_search(user_request, limit=limit)
-
-        result = {
-            "query": user_request,
-            "actions": actions,
-        }
-
-        if not actions:
-            procedures = self.procedure_search(user_request, limit=limit)
-            result["procedures"] = procedures
-
-            if not procedures:
-                sections = self.manual_search(user_request, limit=limit)
-                result["sections"] = sections
-        else:
-            result["procedures"] = []
-            result["sections"] = []
-
-        return result
+        return self._service.planner_retrieve(user_request, limit=limit)

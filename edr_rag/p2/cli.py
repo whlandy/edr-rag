@@ -45,14 +45,20 @@ def _cli_build_actions(args: argparse.Namespace):
 
 
 def _cli_action_search(args: argparse.Namespace):
-    from .api import EdrRagAPI
+    from ..retrieval import RetrievalService
 
-    api = EdrRagAPI(args.workdir)
-    results = api.action_search(
+    service = RetrievalService(args.workdir)
+    filters = {}
+    if args.risk:
+        filters["risk"] = args.risk
+    if args.status:
+        filters["status"] = args.status
+    results = service.search(
         args.query,
-        limit=args.limit,
-        risk_filter=args.risk,
-        status_filter=args.status,
+        corpus_type="actions",
+        strategy="keyword",
+        filters=filters,
+        top_k=args.limit,
     )
 
     if not results:
@@ -73,10 +79,10 @@ def _cli_action_search(args: argparse.Namespace):
 
 
 def _cli_get_action(args: argparse.Namespace):
-    from .api import EdrRagAPI
+    from ..retrieval import RetrievalService
 
-    api = EdrRagAPI(args.workdir)
-    action = api.get_action(args.action_id)
+    service = RetrievalService(args.workdir)
+    action = service.get("actions", args.action_id, key_field="action_id")
 
     if not action:
         print(f"Action '{args.action_id}' not found", file=sys.stderr)
@@ -86,10 +92,10 @@ def _cli_get_action(args: argparse.Namespace):
 
 
 def _cli_planner_retrieve(args: argparse.Namespace):
-    from .api import EdrRagAPI
+    from ..retrieval import RetrievalService
 
-    api = EdrRagAPI(args.workdir)
-    result = api.planner_retrieve(args.query, limit=args.limit)
+    service = RetrievalService(args.workdir)
+    result = service.planner_retrieve(args.query, limit=args.limit)
 
     print(f"Planner retrieval for: {args.query}")
     print()

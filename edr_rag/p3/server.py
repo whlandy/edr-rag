@@ -67,70 +67,35 @@ class EdrRagAgent:
     def __init__(self, workdir: str):
         self.workdir = Path(workdir)
         self.feedback_store = FeedbackStore(str(self.workdir / "feedback.jsonl"))
+        # Unified retrieval entry (P0-2) — the only way to access JSONL artifacts.
+        from edr_rag.retrieval import RetrievalService
+        self.retrieval = RetrievalService(self.workdir)
 
     # ----- Knowledge search tools -----
 
     def search_sections(self, query: str, limit: int = 5) -> list[dict]:
-        """Search P0 sections.jsonl by keyword."""
-        sections_path = self.workdir / "sections.jsonl"
-        if not sections_path.exists():
-            return []
-        from edr_rag.p1.search import JsonlCorpus
-        corpus = JsonlCorpus.from_file(sections_path)
-        return corpus.keyword_search(query, limit=limit)
+        """Search P0 sections.jsonl."""
+        return self.retrieval.search(query, corpus_type="sections", top_k=limit)
 
     def search_procedures(self, query: str, limit: int = 5) -> list[dict]:
-        """Search P1 procedures.jsonl by keyword."""
-        procs_path = self.workdir / "procedures.jsonl"
-        if not procs_path.exists():
-            return []
-        from edr_rag.p1.search import JsonlCorpus
-        corpus = JsonlCorpus.from_file(procs_path)
-        return corpus.keyword_search(query, limit=limit)
+        """Search P1 procedures.jsonl."""
+        return self.retrieval.search(query, corpus_type="procedures", top_k=limit)
 
     def search_actions(self, query: str, limit: int = 5) -> list[dict]:
-        """Search P2 actions.jsonl by keyword."""
-        actions_path = self.workdir / "actions.jsonl"
-        if not actions_path.exists():
-            return []
-        from edr_rag.p1.search import JsonlCorpus
-        corpus = JsonlCorpus.from_file(actions_path)
-        return corpus.keyword_search(query, limit=limit)
+        """Search P2 actions.jsonl (rich action result)."""
+        return self.retrieval.search(query, corpus_type="actions", top_k=limit)
 
     def search_chunks(self, query: str, limit: int = 5) -> list[dict]:
-        """Search P1 chunks.jsonl by keyword."""
-        chunks_path = self.workdir / "chunks.jsonl"
-        if not chunks_path.exists():
-            return []
-        from edr_rag.p1.search import JsonlCorpus
-        corpus = JsonlCorpus.from_file(chunks_path)
-        return corpus.keyword_search(query, limit=limit)
+        """Search P1 chunks.jsonl."""
+        return self.retrieval.search(query, corpus_type="chunks", top_k=limit)
 
     def get_action(self, action_id: str) -> Optional[dict]:
         """Retrieve a specific action by action_id."""
-        actions_path = self.workdir / "actions.jsonl"
-        if not actions_path.exists():
-            return None
-        with actions_path.open(encoding="utf-8") as f:
-            for line in f:
-                if line.strip():
-                    data = json.loads(line)
-                    if data.get("action_id") == action_id:
-                        return data
-        return None
+        return self.retrieval.get("actions", action_id, key_field="action_id")
 
     def get_procedure(self, procedure_id: str) -> Optional[dict]:
         """Retrieve a specific procedure by id."""
-        procs_path = self.workdir / "procedures.jsonl"
-        if not procs_path.exists():
-            return None
-        with procs_path.open(encoding="utf-8") as f:
-            for line in f:
-                if line.strip():
-                    data = json.loads(line)
-                    if data.get("id") == procedure_id:
-                        return data
-        return None
+        return self.retrieval.get("procedures", procedure_id, key_field="id")
 
     # ----- Feedback tools -----
 
