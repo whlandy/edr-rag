@@ -97,6 +97,39 @@ def test_acl_filter_preserves_order_and_drops_restricted():
     assert [r["id"] for r in acl_filter(results, policy)] == [1, 3]
 
 
+def test_acl_search_recalls_authorized_result_beyond_unfiltered_top_k(tmp_path):
+    records = [
+        {
+            "id": f"restricted-{i}",
+            "title": "代理配置",
+            "content": "代理 " * (20 - i),
+            "tenant": "rival",
+        }
+        for i in range(5)
+    ]
+    records.append({
+        "id": "authorized",
+        "title": "代理配置",
+        "content": "代理",
+        "tenant": "acme",
+    })
+    (tmp_path / "sections.jsonl").write_text(
+        "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+    results = RetrievalService(tmp_path).search(
+        "代理",
+        corpus_type="sections",
+        strategy="keyword",
+        top_k=1,
+        query_expansion=False,
+        acl=ACLPolicy(tenants={"acme"}, restrict_unlabeled=True),
+    )
+
+    assert [result["id"] for result in results] == ["authorized"]
+
+
 # ---------- 纯逻辑: 注入检测 ----------
 
 

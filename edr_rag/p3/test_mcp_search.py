@@ -62,12 +62,10 @@ def test_search_actions_strategy(agent: EdrRagAgent, strategy: str):
     # Every strategy must recall the proxy action (by title).
     titles = [r["title"] for r in results]
     assert "配置代理服务器" in titles, f"search_actions({strategy}) missing proxy action"
-    # The rich action id (action_id) is only populated on the keyword path;
-    # bm25/vector/hybrid keep the generic retrieval shape (documented P0-2 behaviour).
-    if strategy == "keyword":
-        assert results[0]["id"] == "network.configure_proxy"
-    else:
-        assert "network.configure_proxy" not in [r["id"] for r in results]
+    # Every strategy follows the same rich action-result contract.  In
+    # particular, ``id`` is always action_id so ACL lookup, citations and MCP
+    # consumers do not need strategy-specific branches.
+    assert "network.configure_proxy" in [r["id"] for r in results]
 
 
 @pytest.mark.parametrize("strategy", STRATEGIES)

@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 
 from edr_rag.index_versioning import (
+    VERSIONS_SCHEMA_VERSION,
     activate_version,
     capture_version,
     compute_fingerprints,
@@ -99,6 +100,11 @@ def test_rollback_to_previous(tmp_path):
     assert target.version_id == 1
     registry = load_versions(tmp_path)
     assert current_version(registry, "procedures").version_id == 1
+    restored = [
+        json.loads(line)
+        for line in (tmp_path / "procedures.jsonl").read_text().splitlines()
+    ]
+    assert restored == recs1
 
 
 def test_rollback_when_no_history_returns_none(tmp_path):
@@ -117,6 +123,22 @@ def test_activate_specific_version(tmp_path):
     assert target.version_id == 2
     registry = load_versions(tmp_path)
     assert current_version(registry, "chunks").version_id == 2
+    restored = [
+        json.loads(line)
+        for line in (tmp_path / "chunks.jsonl").read_text().splitlines()
+    ]
+    assert restored == [_rec("a", "1"), _rec("b", "2")]
+
+
+def test_activate_refuses_metadata_only_version(tmp_path):
+    capture_version(
+        tmp_path,
+        corpus="chunks",
+        fingerprints={"a": "fingerprint-only"},
+    )
+
+    assert activate_version(tmp_path, corpus="chunks", version_id=1) is None
+    assert not (tmp_path / "chunks.jsonl").exists()
 
 
 def test_activate_missing_version_returns_none(tmp_path):
@@ -150,11 +172,12 @@ def test_versions_json_persisted(tmp_path):
     capture_version(tmp_path, corpus="chunks", records=[_rec("a", "x")], source_hash="src1")
     p = versions_path(tmp_path)
     data = json.loads(p.read_text("utf-8"))
-    assert data["schema_version"] == 1
+    assert data["schema_version"] == VERSIONS_SCHEMA_VERSION
     ver = data["versions"]["chunks"][0]
     assert ver["corpus"] == "chunks"
     assert ver["source_hash"] == "src1"
     assert set(ver["fingerprints"]) == {"a"}
+    assert (tmp_path / ver["snapshot_file"]).is_file()
 
 
 def test_previous_version_returns_older(tmp_path):

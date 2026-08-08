@@ -12,10 +12,10 @@
       built_at      : 构建时间 (UTC)。
       active        : 当前是否激活。
 
-  所有版本集中持久化到 <workdir>/index_versions.json (原子写入)。同一
-  corpus 可有多个历史版本；新版本捕获后即成为 active，但旧版本仍保留在
-  注册表中，因此可以随时「灰度切换」——回滚到任一历史版本 (activate)，
-  让检索/消费侧切回旧索引，实现故障时的安全回退。
+  版本元数据集中持久化到 <workdir>/index_versions.json，语料快照保存在
+  <workdir>/.index_versions/<corpus>/。切换版本时先恢复对应 JSONL 快照，
+  进程内缓存随后按文件签名失效，向量索引按恢复后的语料惰性重建。因此
+  activate/rollback 不再只是切换一个没有运行时效果的 active 标记。
 
   与 index_manifest 的关系：index_manifest 记录的是产物的内容 hash 是否
   过期 (read 时校验)；index_versions 记录的是**版本历史**，用于「切到哪个
@@ -36,7 +36,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from .atomic_io import atomically_replace_file
+from .atomic_io import atomic_write_text, atomically_replace_file
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +44,16 @@ logger = logging.getLogger(__name__)
 _VERSIONS_FILE = "index_versions.json"
 
 #: 版本注册表格式版本。
-VERSIONS_SCHEMA_VERSION = 1
+VERSIONS_SCHEMA_VERSION = 2
+
+_CORPUS_FILES = {
+    "sections": "sections.jsonl",
+    "procedures": "procedures.jsonl",
+    "actions": "actions.jsonl",
+    "chunks": "chunks.jsonl",
+    "nodes": "nodes.jsonl",
+    "images": "ocr.jsonl",
+}
 
 
 @dataclass
@@ -58,6 +67,7 @@ class IndexVersion:
     records_hash: str = ""              # 整批语料内容指纹 (sha1)
     active: bool = True
     fingerprints: dict[str, str] = field(default_factory=dict)  # id -> 内容指纹
+    snapshot_file: str = ""                # 可恢复的语料快照（相对 workdir）
 
     def to_json(self) -> dict:
         return asdict(self)
@@ -72,6 +82,7 @@ class IndexVersion:
             records_hash=d.get("records_hash", ""),
             active=bool(d.get("active", False)),
             fingerprints=d.get("fingerprints", {}) or {},
+            snapshot_file=d.get("snapshot_file", ""),
         )
 
 
@@ -288,15 +299,28 @@ def capture_version(
 
     registry = load_versions(workdir)
     versions = _load_or_empty(registry, corpus)
+    version_id = _next_version_id(versions)
+
+    snapshot_file = ""
+    if records is not None and corpus in _CORPUS_FILES:
+        snapshot = Path(".index_versions") / corpus / f"v{version_id}.jsonl"
+        snapshot_path = Path(workdir) / snapshot
+        payload = "".join(
+            json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+            for record in records
+        )
+        atomic_write_text(snapshot_path, payload)
+        snapshot_file = snapshot.as_posix()
 
     new_ver = IndexVersion(
-        version_id=_next_version_id(versions),
+        version_id=version_id,
         corpus=corpus,
         built_at=datetime.now(timezone.utc).isoformat(),
         source_hash=source_hash,
         records_hash=records_hash,
         active=True,
         fingerprints=fingerprints,
+        snapshot_file=snapshot_file,
     )
 
     if keep_history:
@@ -332,6 +356,27 @@ def activate_version(
     target = next((v for v in versions if v.version_id == version_id), None)
     if target is None:
         return None
+    # A registry entry alone is not a rollback. Restore the captured corpus
+    # snapshot first so keyword/BM25 and the lazily rebuilt vector index all
+    # observe the selected version. Legacy metadata-only entries are refused.
+    artifact_name = _CORPUS_FILES.get(corpus)
+    if not artifact_name or not target.snapshot_file:
+        logger.warning(
+            "index version %s/%s has no restorable snapshot", corpus, version_id
+        )
+        return None
+    snapshot_root = (Path(workdir) / ".index_versions").resolve()
+    snapshot = (Path(workdir) / target.snapshot_file).resolve()
+    if snapshot_root not in snapshot.parents:
+        logger.warning("index version snapshot escapes snapshot root: %s", snapshot)
+        return None
+    if not snapshot.is_file():
+        logger.warning("index version snapshot missing: %s", snapshot)
+        return None
+    atomic_write_text(
+        Path(workdir) / artifact_name,
+        snapshot.read_text(encoding="utf-8"),
+    )
     for v in versions:
         v.active = (v.version_id == version_id)
     save_versions(workdir, registry)

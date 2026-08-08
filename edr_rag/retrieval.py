@@ -205,8 +205,24 @@ class RetrievalService:
         """
         filters = filters or {}
         top_k = max(int(top_k), 0)
+        requested_top_k = top_k
         recall_budget = max(int(recall_budget), 1)
         rerank_enabled = RERANK_ENABLED if rerank is None else bool(rerank)
+
+        # ACL must participate in recall, not merely filter an already
+        # truncated top-k result.  The current local stores cannot push an ACL
+        # predicate into every strategy, so conservatively rank the complete
+        # corpus and trim only after authorization.  Backends with native
+        # metadata filtering can replace this fallback later.
+        acl_restricted = acl is not None and not acl.unrestricted
+        if acl_restricted:
+            corpus = self._corpus(corpus_type)
+            top_k = len(corpus.records) if corpus is not None else 0
+
+        # Context expansion can include neighbouring records that have not
+        # independently passed ACL checks. Disable it for restricted queries
+        # until context assembly becomes ACL-aware.
+        safe_with_context = with_context and not acl_restricted
 
         # 精确 id 获取模式：不做全文打分，直接按主键取。
         if filters.get("id") is not None:
@@ -244,10 +260,10 @@ class RetrievalService:
                     variants[0] if variants else query,
                     corpus_type, strategy, filters,
                     top_k, recall_budget, rerank_enabled,
-                    with_context, adjacency,
+                    safe_with_context, adjacency,
                 ),
                 acl,
-            )
+            )[:requested_top_k]
         # 多查询：逐变体召回一路，按变体位置降权 RRF 融合，再截断 top_k。
         variant_weights = [
             1.0 / (1.0 + 0.3 * i) for i in range(len(variants))
@@ -264,11 +280,10 @@ class RetrievalService:
         if not per_variant:
             return []
         fused = rrf_fuse(per_variant, weights=variant_weights)
-        fused = fused[:top_k] if top_k else fused
-        if with_context and corpus_type == "nodes" and fused:
+        if safe_with_context and corpus_type == "nodes" and fused:
             fused = self._enrich_with_context(fused, adjacency=adjacency)
         # P3-3: 多查询融合后同样应用文档级 ACL 过滤。
-        return self._filter_acl_corpus(corpus_type, fused, acl)
+        return self._filter_acl_corpus(corpus_type, fused, acl)[:requested_top_k]
 
     def _filter_acl_corpus(
         self,
