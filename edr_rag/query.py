@@ -131,8 +131,20 @@ def _legacy_synonyms() -> list[tuple[str, str]]:
     再用同一份评测集去调 RRF 权重 —— 指标只是在验证「我们把答案抄进了
     代码」。P4 把词表外置到 data/synonyms.zh.txt，并加结构性测试禁止
     从评测集反抄（见 tests/test_query_expansion.py）。
+
+    ⚠ 词表与评测集是否同源已由 tests/test_query_expansion.py 结构性把关；
+    评测侧仍按「命中别名表 ⇒ 召回含查表贡献」切片汇报 in_vocab / oov
+    （见 edr_rag/eval/vocab.py）。往词表文件加规则时请知悉：新覆盖的
+    查询会自动从 oov 移进 in_vocab（切片标签实时推导），oov 那一列才是
+    真正要盯的泛化数字。
     """
     return get_synonyms()
+
+
+#: 向后兼容 + 评测切片实时推导用的模块属性：eval/vocab.py 走模块属性读取
+#: （而非 from-import 绑定），保证 EDR_RAG_SYNONYMS 换表 / 测试 monkeypatch
+#: 词表时，in_vocab 判定跟着变。仅读；修改词表请用词表文件 + reset_synonyms_cache。
+SYNONYMS: list[tuple[str, str]] = _legacy_synonyms()
 
 
 def expand_query(text: str, max_variants: int = 5) -> list[str]:

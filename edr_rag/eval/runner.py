@@ -38,6 +38,7 @@ from .generation import (
     refusal_rate,
 )
 from .metrics import aggregate_metrics, query_metrics
+from .vocab import SLICE_ALL, SLICE_IN_VOCAB, SLICE_OOV, in_slice, is_in_vocabulary
 
 DEFAULT_STRATEGIES = ("keyword", "bm25", "hybrid")
 
@@ -60,6 +61,10 @@ class QueryResult:
     # P2-6: 生成维度标注（透传自 EvalQuery，供汇总时按策略分组）。
     expected_refusal: Optional[bool] = None
     high_risk: Optional[bool] = None
+    # 词表覆盖切片标记：该查询是否命中 query.py 的 SYNONYMS 别名表。
+    # 由 eval.vocab 从别名表实时推导，用于把「查表贡献」与「泛化能力」
+    # 分开汇报（详见 eval/vocab.py）。
+    in_vocabulary: bool = False
 
 
 @dataclass
@@ -69,17 +74,43 @@ class EvalReport:
     eval_set: EvalSet
     rows: list[QueryResult] = field(default_factory=list)
 
-    def by_strategy(self) -> dict[str, list[QueryResult]]:
+    def by_strategy(self, slice_name: str = SLICE_ALL) -> dict[str, list[QueryResult]]:
+        """按策略分组结果行；``slice_name`` 可限定词表覆盖切片。
+
+        切片语义见 eval/vocab.py：``in_vocab`` 的召回含同义词表的查表贡献，
+        ``oov`` 才反映泛化能力。缺省 ``all`` 为不切片（向后兼容）。
+        """
         out: dict[str, list[QueryResult]] = {}
         for r in self.rows:
+            if not in_slice(r.in_vocabulary, slice_name):
+                continue
             out.setdefault(r.strategy, []).append(r)
         return out
 
-    def summary(self, keys=("recall@k", "mrr", "ndcg@k", "filter_accuracy")) -> dict[str, dict[str, float]]:
-        """按策略聚合 retrieval 维度指标，返回 {strategy: {metric: mean}}。"""
+    def slice_sizes(self) -> dict[str, int]:
+        """各词表切片下的**查询变体**数（跨策略去重，按 qid 统计）。"""
+        seen: dict[str, set[str]] = {SLICE_IN_VOCAB: set(), SLICE_OOV: set()}
+        for r in self.rows:
+            seen[SLICE_IN_VOCAB if r.in_vocabulary else SLICE_OOV].add(r.qid)
+        return {
+            SLICE_ALL: len(seen[SLICE_IN_VOCAB] | seen[SLICE_OOV]),
+            SLICE_IN_VOCAB: len(seen[SLICE_IN_VOCAB]),
+            SLICE_OOV: len(seen[SLICE_OOV]),
+        }
+
+    def summary(
+        self,
+        keys=("recall@k", "mrr", "ndcg@k", "filter_accuracy"),
+        slice_name: str = SLICE_ALL,
+    ) -> dict[str, dict[str, float]]:
+        """按策略聚合 retrieval 维度指标，返回 {strategy: {metric: mean}}。
+
+        ``slice_name`` 限定词表覆盖切片（``all`` / ``in_vocab`` / ``oov``）。
+        用 ``oov`` 判断泛化能力——``in_vocab`` 的数字含同义词表的查表贡献。
+        """
         return {
             strategy: aggregate_metrics([r.metrics for r in rows], keys)
-            for strategy, rows in self.by_strategy().items()
+            for strategy, rows in self.by_strategy(slice_name).items()
         }
 
     def generation_summary(self) -> dict[str, dict[str, float]]:
@@ -194,6 +225,7 @@ def _run_query(
         generation_metrics=generation_metrics,
         expected_refusal=q.expected_refusal,
         high_risk=q.high_risk,
+        in_vocabulary=is_in_vocabulary(q.query),
     )
 
 
@@ -240,6 +272,36 @@ def run_eval(
     return EvalReport(eval_set=eval_set, rows=rows)
 
 
+def _format_vocab_slices(report: EvalReport, metric_labels: dict[str, str]) -> list[str]:
+    """渲染 in_vocab / oov 词表切片对比表（两个切片都非空时才输出）。
+
+    只有一个切片有样本时整张表退化成上面那张全集表的复制品，纯噪音，直接
+    跳过。切片语义与「为什么要分开看」见 eval/vocab.py。
+    """
+    sizes = report.slice_sizes()
+    if not (sizes[SLICE_IN_VOCAB] and sizes[SLICE_OOV]):
+        return []
+
+    lines = ["", "== Retrieval 维度 · 词表覆盖切片 =="]
+    lines.append(
+        f"in_vocab ({sizes[SLICE_IN_VOCAB]} 条): 命中 query.py 的 SYNONYMS 别名表。"
+        f"该表照评测集改写写成，此列含查表贡献，仅用于回归别名表是否生效。"
+    )
+    lines.append(
+        f"oov      ({sizes[SLICE_OOV]} 条): 未命中别名表 —— 判断泛化能力请看这一列。"
+    )
+    head = f"{'切片':<10}{'策略':<10}" + "".join(
+        f"{metric_labels.get(m, m):>14}" for m in metric_labels
+    )
+    lines.append(head)
+    lines.append("-" * len(head))
+    for slice_name in (SLICE_IN_VOCAB, SLICE_OOV):
+        for strategy, metrics in report.summary(slice_name=slice_name).items():
+            cells = "".join(f"{metrics.get(m, 0.0):>14.4f}" for m in metric_labels)
+            lines.append(f"{slice_name:<10}{strategy:<10}{cells}")
+    return lines
+
+
 def format_summary(report: EvalReport) -> str:
     """把策略级汇总渲染成可读的多行文本 (中文表头)。
 
@@ -266,6 +328,9 @@ def format_summary(report: EvalReport) -> str:
     for strategy, metrics in summary.items():
         cells = "".join(f"{metrics.get(m, 0.0):>14.4f}" for m in metric_labels)
         lines.append(f"{strategy:<10}{cells}")
+
+    # --- 词表覆盖切片 ---
+    lines.extend(_format_vocab_slices(report, metric_labels))
 
     # --- generation 维度 ---
     lines.append("")

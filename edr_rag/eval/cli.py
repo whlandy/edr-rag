@@ -21,6 +21,7 @@ import sys
 
 from .dataset import EvalSet, EvalSetValidationError, load_eval_set
 from .runner import DEFAULT_STRATEGIES, format_summary, run_eval
+from .vocab import EVAL_SLICES, SLICE_OOV, matched_synonyms
 
 
 def _load(args) -> "EvalSet":
@@ -84,6 +85,23 @@ def _cli_validate(args: argparse.Namespace):
           f"变体合计 {evalset.variant_total} 条")
     print("corpus 覆盖:", sorted({q.corpus_type for q in evalset.queries}))
 
+    # 词表覆盖：命中 SYNONYMS 别名表的查询，其召回含查表贡献，评测时要单独看。
+    covered: list[tuple[str, str, list[str]]] = []
+    for q in evalset.queries:
+        for qid, text in q.effective_queries(use_paraphrases=True):
+            hits = matched_synonyms(text)
+            if hits:
+                covered.append((qid, text, hits))
+    total_variants = evalset.variant_total
+    print(
+        f"词表覆盖: {len(covered)}/{total_variants} 条变体命中 query.py 的 "
+        f"SYNONYMS 别名表 (in_vocab)"
+    )
+    if covered:
+        print("  这些变体的召回含查表贡献，泛化能力请看 compare 输出里的 oov 切片：")
+        for qid, text, hits in covered:
+            print(f"    {qid:<10} {text}  ← {'、'.join(hits)}")
+
 
 def _cli_tune(args: argparse.Namespace):
     """(P1-6，P4 加 holdout) 网格搜索 hybrid 的 RRF 融合权重。"""
@@ -91,13 +109,16 @@ def _cli_tune(args: argparse.Namespace):
     from .tune import tune_rrf_weights
 
     result = tune_rrf_weights(
-        args.workdir, evalset, metric=args.metric,
+        args.workdir, evalset, metric=args.metric, eval_slice=args.slice,
         holdout_ratio=args.holdout_ratio,
     )
     if result.candidates_tried == 0:
         print("评测集为空，跳过权重调节 (返回默认等权)。")
         return
     print(f"目标指标: {result.metric}")
+    print(f"选优切片: {result.eval_slice}"
+          + (f"  (请求 {args.slice}，该切片无样本，已退回全集)"
+             if result.eval_slice != args.slice else ""))
     print(f"切分:     train {result.train_size} 条 / holdout {result.holdout_size} 条")
     print(f"候选网格: {result.candidates_tried} 个配置 (在 train 上选)")
     for cfg, score in sorted(result.scores.items(), key=lambda kv: -kv[1]):
@@ -159,6 +180,10 @@ def main():
     )
     p_tune.add_argument("--metric", default="recall@k",
                         choices=["recall@k", "mrr", "ndcg@k", "filter_accuracy"])
+    p_tune.add_argument("--slice", default=SLICE_OOV, choices=list(EVAL_SLICES),
+                        help="用于选优的词表覆盖切片 (缺省 oov：只在未被 "
+                             "SYNONYMS 别名表覆盖的查询上选，避免在查表已保证"
+                             "命中的样本上调参)")
     p_tune.set_defaults(func=_cli_tune)
 
     args = parser.parse_args()

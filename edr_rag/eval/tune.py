@@ -25,8 +25,8 @@ from typing import Iterable, Optional
 
 from ..retrieval import RetrievalService
 from .dataset import EvalSet
-from .metrics import aggregate_metrics
 from .runner import run_eval
+from .vocab import SLICE_ALL, SLICE_OOV, in_slice, is_in_vocabulary
 
 #: 默认候选权重网格。每条为 [keyword, bm25] 权重；有 embedder 时在每条后补
 #: vector 权重。值越大该路在 RRF 融合中的贡献越高。
@@ -128,6 +128,13 @@ class TuningResult:
     split_applied: bool = True
     """False 表示评测集太小无法切分，此时 holdout_score 与 best_score 同源、不可信。"""
 
+    eval_slice: str = SLICE_OOV
+    """实际用于打分选优的词表覆盖切片。
+
+    请求的切片在评测集上无样本时会退回 ``all``，此处记录**实际生效**的那个，
+    以免调用方误以为选出来的权重是在 OOV 上挑的。
+    """
+
     @property
     def overfit_gap(self) -> float:
         """train 与 holdout 的分数差 —— 明显为正说明在过拟合调参集。"""
@@ -144,14 +151,33 @@ def _score_for_service(
     eval_set: EvalSet,
     metric: str,
     corpus_workdir: str | Path,
+    eval_slice: str = SLICE_OOV,
 ) -> float:
-    """对给定 (已设好权重的) service 跑一次 hybrid 评测，返回目标指标均值。"""
+    """对给定 (已设好权重的) service 跑一次 hybrid 评测，返回目标指标均值。
+
+    ``eval_slice`` 限定用于打分的词表覆盖切片，缺省 ``oov``——见
+    tune_rrf_weights 的说明。
+    """
     report = run_eval(
         corpus_workdir, eval_set, strategies=("hybrid",), service=service
     )
-    summary = report.summary(keys=(metric,))
+    summary = report.summary(keys=(metric,), slice_name=eval_slice)
     row = summary.get("hybrid", {})
     return float(row.get(metric, 0.0))
+
+
+def _resolve_eval_slice(eval_set: EvalSet, eval_slice: str) -> str:
+    """目标切片在本评测集上没有样本时退回 ``all``，并说明退回了。
+
+    权重搜索在空切片上会给每个候选都打 0 分，静默选中网格里的第一条——
+    与其给出一个看似成功的假结果，不如退回全集并让调用方看到。
+    """
+    if eval_slice == SLICE_ALL:
+        return SLICE_ALL
+    for q in eval_set.queries:
+        if in_slice(is_in_vocabulary(q.query), eval_slice):
+            return eval_slice
+    return SLICE_ALL
 
 
 def tune_rrf_weights(
@@ -160,6 +186,7 @@ def tune_rrf_weights(
     metric: str = "recall@k",
     grid: Optional[Iterable[list[float]]] = None,
     candidates: Optional[Iterable[list[float] | None]] = None,
+    eval_slice: str = SLICE_OOV,
     holdout_ratio: float = DEFAULT_HOLDOUT_RATIO,
     seed: int = DEFAULT_SPLIT_SEED,
 ) -> TuningResult:
@@ -173,10 +200,18 @@ def tune_rrf_weights(
 
     P1-6 的实现在同一份评测集上搜索并报告最优分数，那个数天然乐观。
 
+    默认只在 **OOV 切片**（未被 query.py 的 SYNONYMS 别名表覆盖的查询）上
+    选优。别名表是照着本评测集的改写写成的，在被它覆盖的查询上召回近乎被
+    保证命中——这些样本对权重几乎没有区分度，却会稀释真正有信息量的样本，
+    把权重选到一个只在查表命中时才好看的位置。详见 eval/vocab.py。
+
     Args:
         workdir: 检索工作目录 (含 actions.jsonl 等)。
         eval_set: 评测集 (EvalSet)。
         metric: 用于挑选最优配置的指标，默认 'recall@k'。
+        eval_slice: 用于打分选优的词表覆盖切片，默认 'oov'。传 'all' 可回到
+            旧行为（在全部查询上选优）。目标切片无样本时自动退回 'all'，
+            实际生效的切片记录在 TuningResult.eval_slice。
         grid: 候选 [keyword, bm25] 权重网格；缺省用 DEFAULT_GRID。
             有 embedder (vector 可用) 时，每条后自动补上 vector 权重
             (取 keyword 权重的 1.2 倍作为合理起点)。
@@ -206,12 +241,23 @@ def tune_rrf_weights(
             best_weights=None, best_score=0.0, scores={}, metric=metric,
             candidates_tried=0, holdout_score=0.0, baseline_holdout_score=0.0,
             train_size=0, holdout_size=0, split_applied=False,
+            eval_slice=SLICE_ALL,
         )
 
-    train, holdout = split_eval_set(eval_set, holdout_ratio=holdout_ratio, seed=seed)
-    # 真正切开时两份加起来正好是全集；未切分时两份都是全集 (和为 2N)。
+    # P1-6：先按词表覆盖切片收敛选优范围（oov 才有泛化信息量），
+    # P4：再在切出的查询集上做 train/holdout 切分防过拟合。两者正交。
+    active_slice = _resolve_eval_slice(eval_set, eval_slice)
+    if active_slice == SLICE_ALL:
+        selection_pool = eval_set
+    else:
+        pooled = [q for q in eval_set.queries
+                  if in_slice(is_in_vocabulary(q.query), active_slice)]
+        selection_pool = EvalSet(queries=pooled, name=f"{eval_set.name}:{active_slice}")
+
+    train, holdout = split_eval_set(selection_pool, holdout_ratio=holdout_ratio, seed=seed)
+    # 真正切开时两份加起来正好是选优池；未切分时两份都是选优池 (和为 2N)。
     split_applied = (
-        len(train.queries) + len(holdout.queries) == len(eval_set.queries)
+        len(train.queries) + len(holdout.queries) == len(selection_pool.queries)
     )
 
     best_weights: list[float] | None = None
@@ -221,7 +267,7 @@ def tune_rrf_weights(
     for w in grid_src:
         svc = RetrievalService(workdir)
         svc.set_fusion_weights(w)
-        score = _score_for_service(svc, train, metric, workdir)
+        score = _score_for_service(svc, train, metric, workdir, active_slice)
         scores[str(w)] = score
         tried += 1
         if score > best_score:
@@ -249,4 +295,5 @@ def tune_rrf_weights(
         train_size=len(train.queries),
         holdout_size=len(holdout.queries),
         split_applied=split_applied,
+        eval_slice=active_slice,
     )
