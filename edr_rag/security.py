@@ -29,6 +29,8 @@ ACL 模型:
   调用方通过 `ACLPolicy` 声明自己允许访问的设备/租户:
     - tenants=None 表示不限制租户；否则仅放行 tenant 在允许集合内的记录。
     - devices=None 表示不限制设备；否则仅放行 device 在允许集合内的记录。
+    - 注意 None 与空集合语义不同：None = 该维度不设限（放行全部），
+      set() = 该维度不允许任何值（明确声明了该维度的记录一律拒绝）。
     - 记录维度缺失时视为「未声明」：若策略对该维度有限制（set 非 None），
       未声明该维度的记录被放行（保守原则：不能因为记录漏标就误伤公开内容），
       但可通过 `restrict_unlabeled` 改为按受限维度的"不可见"处理。
@@ -89,8 +91,15 @@ class ACLPolicy:
 
     @property
     def unrestricted(self) -> bool:
-        """是否完全不受限（无任何维度限制 → 等价于无 ACL，主链路零开销）。"""
-        return not self.tenants and not self.devices
+        """是否完全不受限（无任何维度限制 → 等价于无 ACL，主链路零开销）。
+
+        判据必须是 `is None`（「未声明该维度」）而非 falsy：空集合表示
+        「该维度一个值都不允许」，是合法且常见的策略（例如由「当前用户所属
+        租户列表」推导得来，而该用户恰好不属于任何租户）。若把空集合当成
+        不受限，过滤器会在最该关门的时候全部放行——权限判定出错必须往
+        拒绝的方向倒。
+        """
+        return self.tenants is None and self.devices is None
 
     def allows(self, rec: Any) -> bool:
         """判断一条检索记录是否对当前策略可见。畸形输入视为不可见。"""

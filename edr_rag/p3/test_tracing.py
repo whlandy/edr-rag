@@ -180,6 +180,36 @@ def test_agent_search_emits_retrieval_trace(tmp_path: Path):
     assert events[-1]["latency_ms"] >= 0
 
 
+def test_agent_failed_search_emits_failure_trace(tmp_path: Path):
+    """检索失败必须落一条 ok=False 事件，且异常照常向上抛。
+
+    回归：失败分支的条件曾写成 `tracer is not None and ctx is None`（恒假），
+    导致失败永不记录 —— quality_metrics 的错误率恒为 0，可观测性在最该
+    报警的场景是瞎的。
+    """
+    from edr_rag.p3.server import EdrRagAgent
+
+    wd = tmp_path / "workdir"
+    wd.mkdir(parents=True)
+    (wd / "actions.jsonl").write_text(
+        json.dumps({"action_id": "a.x", "title": "t"}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    agent = EdrRagAgent(str(wd), trace=True)
+
+    with pytest.raises(ValueError):
+        agent.search_actions("代理", strategy="not-a-strategy")
+
+    events = TraceStore(wd / "trace.jsonl").read_all()
+    assert len(events) == 1, "失败检索应当落一条事件"
+    ev = events[0]
+    assert ev["event_type"] == EVT_RETRIEVAL
+    assert ev["ok"] is False
+    assert ev["payload"]["result_count"] == 0
+    assert ev["payload"]["context"] == "search_actions"
+    assert ev["payload"]["strategy"] == "not-a-strategy"
+
+
 def test_agent_trace_disabled_writes_nothing(tmp_path: Path):
     from edr_rag.p3.server import EdrRagAgent
 

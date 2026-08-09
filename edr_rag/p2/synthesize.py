@@ -487,6 +487,20 @@ def _op_canonical(op: str) -> str:
     return op.strip().lower()
 
 
+def _step_order(order: Any) -> Optional[int]:
+    """把步骤序号规整为 int；缺失或非数值返回 None（该步不参与顺序比较）。
+
+    抽取自 artifacts 的 order 可能是字符串甚至中文序数，裸 int() 会在
+    答案合成中途抛错——冲突检测是启发式，脏数据只该让它少报一条。
+    """
+    if order is None or isinstance(order, bool):
+        return None
+    try:
+        return int(order)
+    except (TypeError, ValueError):
+        return None
+
+
 def _is_opposite(op1: str, op2: str) -> bool:
     """判断两个操作是否互为反向（互斥）。"""
     op1, op2 = _op_canonical(op1), _op_canonical(op2)
@@ -498,12 +512,32 @@ def _is_opposite(op1: str, op2: str) -> bool:
     return False
 
 
+def _procedure_scope(item: dict, src: dict) -> str:
+    """返回一条记录的「所属流程」标识，用作步骤级冲突的比较范围。
+
+    步骤级冲突要回答的是「描述**同一个流程**的两份文档是否互相矛盾」。若
+    不限定范围而按 (order, action) 全局分组，任意两个无关动作只要第 1 步
+    都是「点击」就会被判为冲突——检索 top-k 本来就是不同流程，这会让几乎
+    每个答案都退化成 conflict + requires_confirmation。
+
+    取值优先级：
+      1. source.procedure_id —— 同一流程的不同文档/变体共享它，是最准的范围键；
+      2. 记录自身 id —— 缺 procedure_id 时退化为「每条记录自成一个范围」，
+         此时只有单条记录内部的重复步骤才可能判冲突，跨记录一律不比较
+         （保守：漏报只是退回普通作答，误报会污染每一个答案）。
+    """
+    return str(src.get("procedure_id") or "") or f"#{item.get('id') or id(item)}"
+
+
 def _detect_conflicts(ctx: dict) -> list[dict]:
     """检测检索到的文档/动作之间的冲突（P2-3）。
 
     启发式（确定性、纯 stdlib，无外部依赖）：
       1. 互斥操作：同一目标(target)同时出现相反的操作（启用/禁用、打开/关闭等）。
-      2. 步骤级冲突：同一 step order 的同一操作动作，目标(target)不一致。
+         按 target 全局比较——同一个目标既要启用又要禁用，无论来自哪份文档
+         都是真冲突。
+      2. 步骤级冲突：**同一流程内**（见 _procedure_scope）同一 step order 的
+         同一操作动作，目标(target)不一致。
       3. 风险矛盾：同一标题/操作在不同来源里的风险等级差异过大（low vs high）。
 
     Returns:
@@ -517,13 +551,14 @@ def _detect_conflicts(ctx: dict) -> list[dict]:
 
     # 1) 互斥操作：target -> [(op, source_ref)]
     target_ops: dict[str, list[tuple[str, dict]]] = {}
-    # 2) 步骤级冲突：(order, op) -> [(target, source_ref)]
-    step_targets: dict[tuple[int, str], list[tuple[str, dict]]] = {}
+    # 2) 步骤级冲突：(流程范围, order, op) -> [(target, source_ref)]
+    step_targets: dict[tuple[str, int, str], list[tuple[str, dict]]] = {}
     # 3) 风险矛盾：title -> [(risk, source_ref)]
     title_risks: dict[str, list[tuple[str, dict]]] = {}
 
     for it in items:
         src = _resolve_source(it)
+        scope = _procedure_scope(it, src)
         title = str(it.get("title") or "").strip() or str(it.get("id") or "").strip()
         if title:
             title_risks.setdefault(title, []).append((str(it.get("risk") or ""), dict(src)))
@@ -532,11 +567,12 @@ def _detect_conflicts(ctx: dict) -> list[dict]:
                 continue
             op = str(s.get("action") or "").strip()
             tgt = str(s.get("target") or "").strip()
-            order = s.get("order")
+            order = _step_order(s.get("order"))
             if tgt and op:
                 target_ops.setdefault(tgt, []).append((op, dict(src)))
             if order is not None and op:
-                step_targets.setdefault((int(order), _op_canonical(op)), []).append((tgt, dict(src)))
+                key = (scope, order, _op_canonical(op))
+                step_targets.setdefault(key, []).append((tgt, dict(src)))
 
     # 互斥操作检测：对每个目标，检查是否存在相反操作对
     ops_by_target: dict[str, set[str]] = {
@@ -556,8 +592,8 @@ def _detect_conflicts(ctx: dict) -> list[dict]:
                         "sources": sources,
                     })
 
-    # 步骤级冲突：同一 (order, action) 出现多个不同 target
-    for (order, op), pairs in step_targets.items():
+    # 步骤级冲突：同一流程内的同一 (order, action) 出现多个不同 target
+    for (_scope, order, op), pairs in step_targets.items():
         distinct_targets = {t for t, _ in pairs if t}
         if len(distinct_targets) > 1:
             sources = [src for _, src in pairs]

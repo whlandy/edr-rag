@@ -38,6 +38,25 @@ def test_unrestricted_policy_allows_everything():
     assert acl_filter([{"id": 1}, {"id": 2}], policy) == [{"id": 1}, {"id": 2}]
 
 
+def test_empty_allow_set_is_restrictive_not_unrestricted():
+    # 空集合 = 「该维度不允许任何值」，绝不能被当成「不受限」而全部放行。
+    # 这是一个 fail-open 回归：空集合是调用方从「用户所属租户列表」推导出来
+    # 的自然产物，若被当成 unrestricted，越权记录会在最该拦的时候被放行。
+    policy = ACLPolicy(tenants=set())
+    assert policy.unrestricted is False
+    assert policy.allows({"tenant": "acme"}) is False
+    assert policy.allows({"metadata": {"tenant": "acme"}}) is False
+    # 未声明租户的记录仍走保守放行（与非空集合时的语义一致）。
+    assert policy.allows({"id": 1}) is True
+    assert acl_filter([{"id": 1, "tenant": "acme"}, {"id": 2}], policy) == [{"id": 2}]
+
+
+def test_empty_device_set_is_restrictive():
+    policy = ACLPolicy(devices=set())
+    assert policy.unrestricted is False
+    assert policy.allows({"device": "host-1"}) is False
+
+
 def test_none_acl_returns_same_list_object():
     results = [{"id": 1}, {"id": 2}]
     assert acl_filter(results, None) is results

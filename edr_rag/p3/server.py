@@ -83,7 +83,6 @@ class EdrRagAgent:
 
     # P3-2: 统一检索追踪辅助 —— 计时 + 记录检索事件，返回 (结果, 耗时ms)。
     def _traced_search(self, ctx, corpus_type, query, limit, strategy, rerank):
-        from edr_rag.p3.tracing import TraceContext
         t0 = time.perf_counter()
         try:
             results = self.retrieval.search(
@@ -92,8 +91,8 @@ class EdrRagAgent:
             )
         except Exception:  # 记录失败事件后重新抛出，主链路异常语义不变
             latency = (time.perf_counter() - t0) * 1000.0
-            if self.tracer is not None and ctx is None:
-                TraceContext(self.tracer, context=f"{corpus_type}.search").record_retrieval(
+            if ctx is not None:
+                ctx.record_retrieval(
                     query, corpus_type, strategy, latency, [], ok=False,
                 )
             raise

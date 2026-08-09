@@ -64,8 +64,14 @@ def test_search_actions_strategy(agent: EdrRagAgent, strategy: str):
     assert "配置代理服务器" in titles, f"search_actions({strategy}) missing proxy action"
     # Every strategy follows the same rich action-result contract.  In
     # particular, ``id`` is always action_id so ACL lookup, citations and MCP
-    # consumers do not need strategy-specific branches.
+    # consumers do not need strategy-specific branches, and risk/status
+    # metadata filtering keeps working uniformly across strategies.
     assert "network.configure_proxy" in [r["id"] for r in results]
+    for field in ("risk", "status", "confidence"):
+        assert field in results[0], (
+            f"search_actions({strategy}) dropped rich field {field!r}; "
+            f"metadata filtering would silently stop working"
+        )
 
 
 @pytest.mark.parametrize("strategy", STRATEGIES)

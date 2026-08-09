@@ -154,6 +154,65 @@ def test_step_target_conflict():
     assert any(c["type"] == "step_conflict" for c in result.conflicts)
 
 
+def test_unrelated_actions_do_not_produce_step_conflict():
+    """互不相关的两个动作不该因为「第 1 步都是点击」而被判冲突。
+
+    回归：步骤级冲突曾按 (order, action) 全局分组，不区分所属流程。检索
+    top-k 返回的本来就是不同流程，任意两条只要第一步动作同名、目标不同
+    就会误判 —— 正常答案被降级成 conflict + requires_confirmation。
+    """
+    firewall = _make_security_action(
+        id="安全.防护.启用防火墙", action_id="安全.防护.启用防火墙", title="启用防火墙",
+        source={"manual_id": "m", "procedure_id": "procedure.安全.防火墙", "file": "security/fw.html"},
+        procedure=[{"order": 1, "action": "click", "target": "防火墙开关",
+                    "source_instruction": "点击防火墙开关"}],
+        risk="medium", status="candidate", requires_confirmation=False,
+    )
+    export = _make_security_action(
+        id="日志.导出.导出日志", action_id="日志.导出.导出日志", title="导出日志",
+        source={"manual_id": "m", "procedure_id": "procedure.日志.导出", "file": "log/export.html"},
+        procedure=[{"order": 1, "action": "click", "target": "导出按钮",
+                    "source_instruction": "点击导出按钮"}],
+        risk="low", status="candidate", requires_confirmation=False,
+    )
+    ctx = {"actions": [firewall, export], "procedures": [], "sections": []}
+    result = synthesize_answer("怎么操作", ctx)
+    assert result.conflicts == []
+    assert result.answer_status == ANSWER_ANSWERED
+    assert result.requires_confirmation is False
+
+
+def test_step_conflict_scoped_to_same_procedure():
+    """同一流程 (procedure_id) 的两份文档在同一步给出不同目标 —— 真冲突。"""
+    act1 = _make_action(procedure=[
+        {"order": 1, "action": "click", "target": "设置A", "source_instruction": "点击设置A"},
+    ])
+    act2 = _make_action(
+        id="网络.代理.其他", action_id="网络.代理.其他", title="配置代理其他",
+        procedure=[
+            {"order": 1, "action": "click", "target": "设置B", "source_instruction": "点击设置B"},
+        ],
+    )
+    # 两条共享 source.procedure_id = 'procedure.网络.代理'
+    assert act1["source"]["procedure_id"] == act2["source"]["procedure_id"]
+    result = synthesize_answer(
+        "如何配置代理", {"actions": [act1, act2], "procedures": [], "sections": []}
+    )
+    assert result.answer_status == ANSWER_CONFLICT
+    assert any(c["type"] == "step_conflict" for c in result.conflicts)
+
+
+def test_step_order_tolerates_non_numeric():
+    """脏 order（非数值）只该让冲突检测少报一条，不该在合成中途抛错。"""
+    act = _make_action(procedure=[
+        {"order": "第一步", "action": "click", "target": "设置A", "source_instruction": "点击"},
+    ])
+    result = synthesize_answer(
+        "如何配置代理", {"actions": [act], "procedures": [], "sections": []}
+    )
+    assert result.answer_status == ANSWER_ANSWERED
+
+
 def test_risk_contradiction_conflict():
     act1 = _make_security_action(title="防火墙设置", risk="low")
     act2 = _make_security_action(
