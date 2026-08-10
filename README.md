@@ -42,6 +42,17 @@ edr-rag ingest --chm ~/Desktop/edr-chm-rag-work/input/product-manual.chm \
 edr-rag validate --workdir ~/Desktop/edr-chm-rag-work
 ```
 
+HTTP service (P4):
+
+```bash
+export EDR_RAG_API_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+edr-rag-serve --workdir ~/Desktop/edr-chm-rag-work --port 8080
+```
+
+Pure stdlib — no fastapi/uvicorn to ship into an air-gapped site. The service
+refuses to start without an API key. See `docs/DEPLOYMENT.md` for the offline
+deployment guide and the full environment-variable reference.
+
 MCP boundary:
 
 ```text
@@ -57,4 +68,12 @@ edr-wd MCP:
   dump_tree
   click_target
   run_powershell
+```
+
+Design documents:
+
+```text
+docs/requirements/EDR-RAG-DESIGN.md      P0–P3 原始设计
+docs/requirements/P4-HARDENING-DESIGN.md P4 商用化硬化（阻塞级 + 严重级修复）
+docs/DEPLOYMENT.md                       内网离线部署指南
 ```

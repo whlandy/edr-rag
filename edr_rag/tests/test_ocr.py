@@ -25,6 +25,21 @@ import pytest  # noqa: E402
 from edr_rag import ocr as ocr_mod  # noqa: E402
 
 
+# ---------------------------------------------------------------------------
+# P4: 依赖真实 OCR 引擎的用例改为 skipif。
+#
+# 旧实现在缺 tesseract / rapidocr 时直接 assert 失败——OCR 引擎是 pyproject
+# 里的**可选** extras，缺它不是缺陷。CI 跑在干净环境里会永远红 6 个，
+# 于是「测试是绿的」这条信号就废了。
+#
+# 纯逻辑用例（缺失文件、非图片、幂等语义、产物结构）不依赖引擎，照常运行。
+# ---------------------------------------------------------------------------
+
+requires_ocr = pytest.mark.skipif(
+    not ocr_mod.ocr_available(),
+    reason="OCR engine (tesseract / rapidocr) not installed; optional `ocr` extras",
+)
+
 @contextmanager
 def _tmp():
     with tempfile.TemporaryDirectory() as td:
@@ -55,12 +70,15 @@ def _write_assets(workdir: Path, records: list[dict]) -> Path:
     return p
 
 
+@requires_ocr
 def test_ocr_available_reflects_backend():
-    # 当前 CI/本机装好了 pytesseract + tesseract，应探测成功。
+    # 走到这里说明 skipif 判定引擎可用，探测函数必须自洽。
     assert ocr_mod.ocr_available() is True
+    assert ocr_mod.get_ocr_engine() is not None
     print(f"[PASS] ocr_available=True, engine={ocr_mod.get_ocr_engine() and 'detected'}")
 
 
+@requires_ocr
 def test_ocr_image_real_text():
     with _tmp() as tmp:
         png = _make_text_png(tmp / "shot.png", "Proxy Configuration")
@@ -75,6 +93,7 @@ def test_ocr_image_graceful_on_missing():
     print("[PASS] ocr_image on missing file returns ''")
 
 
+@requires_ocr
 def test_run_ocr_writes_artifacts():
     with _tmp() as tmp:
         png = _make_text_png(tmp / "png" / "proxy.png", "Enable SSL Proxy")
@@ -120,6 +139,7 @@ def test_run_ocr_writes_artifacts():
     print("[PASS] run_ocr writes ocr_text into assets.jsonl + ocr.jsonl")
 
 
+@requires_ocr
 def test_run_ocr_idempotent():
     with _tmp() as tmp:
         png = _make_text_png(tmp / "png" / "a.png", "Delta Sync")
@@ -176,6 +196,7 @@ def test_run_ocr_missing_image_file_empty_text():
     print("[PASS] run_ocr tolerates missing image file")
 
 
+@requires_ocr
 def test_retrieval_images_corpus():
     """corpus_type='images' 能命中 ocr.jsonl 里的截图文字。"""
     from edr_rag.retrieval import RetrievalService
@@ -201,6 +222,7 @@ def test_retrieval_images_corpus():
     print("[PASS] retrieval corpus_type='images' hits OCR text")
 
 
+@requires_ocr
 def test_search_images_mcp_backend():
     """MCP search_images 走 corpus_type='images'，可检索截图文字。"""
     from edr_rag.p3.server import EdrRagAgent

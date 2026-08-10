@@ -24,6 +24,7 @@ P3 scope (design §7.6 observability):
 from __future__ import annotations
 
 import json
+import os
 import statistics
 import threading
 import time
@@ -43,6 +44,12 @@ _GENERATED_BY_LLM = "llm"
 
 #: 事件类型白名单（用于校验 / 文档）
 EVENT_TYPES = (EVT_RETRIEVAL, EVT_GENERATION, EVT_MODEL_CALL)
+
+#: P4 轮转与缓冲默认值。trace.jsonl 无限增长会吃满客户磁盘；
+#: 每条 open/write/close 在有 QPS 时会让观测本身成为瓶颈。
+DEFAULT_MAX_BYTES = int(os.environ.get("EDR_RAG_TRACE_MAX_BYTES", str(64 * 1024 * 1024)))
+DEFAULT_BACKUP_COUNT = int(os.environ.get("EDR_RAG_TRACE_BACKUPS", "5"))
+DEFAULT_BUFFER_SIZE = int(os.environ.get("EDR_RAG_TRACE_BUFFER", "1"))
 
 
 def _now_iso() -> str:
@@ -85,18 +92,39 @@ class EventTracer:
     绝不向主链路抛出。每次 append 加锁，保证并发安全。
     """
 
-    def __init__(self, path: str | Path):
+    def __init__(
+        self,
+        path: str | Path,
+        max_bytes: int = DEFAULT_MAX_BYTES,
+        backup_count: int = DEFAULT_BACKUP_COUNT,
+        buffer_size: int = DEFAULT_BUFFER_SIZE,
+    ):
+        """
+        Args:
+            max_bytes: 单个 trace 文件的大小上限，超过即轮转。<=0 关闭轮转。
+            backup_count: 保留的历史文件数 (trace.jsonl.1 … .N)。
+            buffer_size: 攒够多少条再落盘。1 表示每条都写 (旧行为)。
+        """
         self.path = Path(path)
+        self.max_bytes = int(max_bytes)
+        self.backup_count = max(int(backup_count), 0)
+        self.buffer_size = max(int(buffer_size), 1)
         self._lock = threading.Lock()
+        self._buffer: list[str] = []
 
     def append(self, event: TraceEvent) -> bool:
         """序列化并追加一条事件到 JSONL。
 
-        Args:
-            event: 待写入事件。trace_id/event_id/ts 为空时自动补全。
+        P4: 带缓冲与轮转。旧实现每条事件 open/write/close 一次文件并加全局
+        锁 —— 在有 QPS 的服务里，可观测性本身成了瓶颈；而且 trace.jsonl
+        无限增长，跑几个月就把客户的磁盘吃满。
+
+        缓冲是 best-effort 的：进程被 kill 时最多丢 buffer_size-1 条观测
+        数据。观测数据不是账本，这个取舍划算；需要每条落盘就把
+        EDR_RAG_TRACE_BUFFER 设成 1。
 
         Returns:
-            True 写入成功；False 在失败时返回（不抛出）。
+            True 写入/入缓冲成功；False 在失败时返回（不抛出）。
         """
         if not event.trace_id:
             event.trace_id = new_trace_id()
@@ -106,17 +134,63 @@ class EventTracer:
             event.ts = _now_iso()
         try:
             line = json.dumps(event.to_dict(), ensure_ascii=False)
-            with self._lock:
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                with self.path.open("a", encoding="utf-8") as f:
-                    f.write(line + "\n")
-            return True
-        except Exception:  # pragma: no cover - best-effort 观测路径
+        except Exception:  # pragma: no cover - 不可序列化的 payload
             return False
+        with self._lock:
+            self._buffer.append(line)
+            if len(self._buffer) >= self.buffer_size:
+                return self._flush_locked()
+        return True
+
+    def flush(self) -> bool:
+        """把缓冲区落盘 (进程退出 / 定期调用)。"""
+        with self._lock:
+            return self._flush_locked()
+
+    def _flush_locked(self) -> bool:
+        """调用方必须已持锁。"""
+        if not self._buffer:
+            return True
+        payload = "".join(line + "\n" for line in self._buffer)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._rotate_if_needed_locked(len(payload.encode("utf-8")))
+            with self.path.open("a", encoding="utf-8") as f:
+                f.write(payload)
+        except Exception:  # pragma: no cover - best-effort 观测路径
+            # 丢掉这批，避免缓冲区无限增长把内存吃掉。
+            self._buffer.clear()
+            return False
+        self._buffer.clear()
+        return True
+
+    def _rotate_if_needed_locked(self, incoming_bytes: int) -> None:
+        """超过 max_bytes 时轮转：trace.jsonl -> .1 -> .2 -> … 丢弃最老的。"""
+        if self.max_bytes <= 0:
+            return
+        try:
+            current = self.path.stat().st_size
+        except FileNotFoundError:
+            return
+        if current + incoming_bytes <= self.max_bytes:
+            return
+        if self.backup_count == 0:
+            # 不留历史：直接截断。
+            self.path.unlink(missing_ok=True)
+            return
+        # 最老的先删，其余依次后移。
+        oldest = self.path.with_suffix(self.path.suffix + f".{self.backup_count}")
+        oldest.unlink(missing_ok=True)
+        for i in range(self.backup_count - 1, 0, -1):
+            src = self.path.with_suffix(self.path.suffix + f".{i}")
+            if src.exists():
+                src.replace(self.path.with_suffix(self.path.suffix + f".{i + 1}"))
+        self.path.replace(self.path.with_suffix(self.path.suffix + ".1"))
 
     def reset(self) -> None:
-        """清空已写入的追踪文件（测试 / 轮转用）。"""
+        """清空已写入的追踪文件与缓冲（测试用）。"""
         with self._lock:
+            self._buffer.clear()
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.write_text("", encoding="utf-8")
 

@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 主门禁：**不装任何可选依赖**。
+  #
+  # 这正是 edr-rag 反复宣称的契约——「缺可选依赖时优雅降级，主链路
+  # (keyword/BM25/组装) 始终可用」。只有在干净环境里跑通，这句话才算数。
+  # P4 之前 CI 根本不存在，而本机装了 llama-index / tesseract，于是没人
+  # 知道干净环境到底还能不能跑。
+  core:
+    name: core (no optional extras)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install (core only)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+
+      - name: Assert optional deps really are absent
+        # 防止将来某个传递依赖悄悄把 llama-index 带进来，
+        # 让「干净环境」这个门禁名存实亡。
+        run: |
+          python - <<'PY'
+          import importlib.util as u
+          leaked = [m for m in ("llama_index", "sentence_transformers", "FlagEmbedding")
+                    if u.find_spec(m) is not None]
+          assert not leaked, f"optional deps leaked into the core env: {leaked}"
+          print("core env is clean")
+          PY
+
+      - name: Test
+        env:
+          # 离线环境不该在测试期访问 HF Hub。
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+        run: pytest -q
+
+  # 装齐可选依赖后再跑一遍：向量检索、rerank、OCR 的真实路径。
+  full:
+    name: full (rag extras)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system OCR engine
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq tesseract-ocr tesseract-ocr-chi-sim
+
+      - name: Install (with extras)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test,rag,ocr]"
+
+      - name: Test
+        run: pytest -q
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Ruff check
+        run: ruff check edr_rag
+
+      - name: Compile-all (catches syntax errors in rarely imported modules)
+        run: python -m compileall -q edr_rag

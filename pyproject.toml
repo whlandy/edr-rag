@@ -42,6 +42,8 @@ edr-rag-p2 = "edr_rag.p2.cli:main"
 edr-rag-mcp = "edr_rag.p3.server:main"
 edr-rag-trace = "edr_rag.p3.trace_cli:main"
 edr-rag-eval = "edr_rag.eval.cli:main"
+# P4: HTTP 服务（纯 stdlib，内网离线部署不引入 fastapi/uvicorn）。
+edr-rag-serve = "edr_rag.service.server:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -56,3 +58,21 @@ force-include = { "edr_rag/eval/data" = "edr_rag/eval/data", "edr_rag/data" = "e
 [tool.pytest.ini_options]
 testpaths = ["edr_rag"]
 pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py310"
+# 本项目的注释与 docstring 是中文，且解释性内容较多；88 列会逼着把
+# 一句完整的中文说明拆成三行，反而更难读。
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP"]
+ignore = [
+    "E501",   # 行宽由 line-length 控制，不再单独报
+    "B008",   # 参数默认值里调用函数——本项目没有这个模式，避免误报
+    "UP038",  # isinstance 元组写法，改动收益不抵审阅成本
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试里大量使用夹具与延迟导入，放宽未使用导入/变量的检查。
+"**/test_*.py" = ["F401", "F811", "B011"]
