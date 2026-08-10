@@ -28,25 +28,88 @@ logger = logging.getLogger(__name__)
 # ---------- Tokenization (CJK-aware) ----------
 
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+_CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]+")
 _WORD_RE = re.compile(r"[A-Za-z0-9_]+")
 _SPLIT_RE = re.compile(r"[^\u4e00-\u9fffA-Za-z0-9_]+")
 
 
+#: P4 Lock 4 —— 是否产出 CJK bigram。可用 EDR_RAG_CJK_BIGRAM=0 关闭以回到
+#: P1 的纯 unigram 行为 (仅用于对照实验，不建议生产关闭)。
+CJK_BIGRAM = os.environ.get("EDR_RAG_CJK_BIGRAM", "1") != "0"
+
+#: jieba 词典分词探测结果 (模块级单例，语义同 _optional_embedder)。
+_jieba_checked = False
+_jieba_cut = None
+
+
+def _optional_jieba():
+    """返回 jieba 的切词函数；未安装时返回 None (bigram 已能兜住主要收益)。"""
+    global _jieba_checked, _jieba_cut
+    if _jieba_checked:
+        return _jieba_cut
+    try:
+        import jieba  # type: ignore
+
+        # search 模式产出更细粒度的重叠切分，利于召回。
+        _jieba_cut = jieba.lcut_for_search
+    except Exception:  # pragma: no cover - optional dep absent
+        _jieba_cut = None
+    _jieba_checked = True
+    return _jieba_cut
+
+
+def reset_tokenizer_cache() -> None:
+    """重置 jieba 探测缓存 (测试用)。"""
+    global _jieba_checked, _jieba_cut
+    _jieba_checked = False
+    _jieba_cut = None
+
+
 def tokenize(text: str) -> list[str]:
-    """Split text into tokens: keep CJK chars individually (unigram-ish),
-    latin words as whole tokens.
+    """把文本切成检索 token：拉丁词整词 + CJK unigram + CJK bigram。
 
     P1-6: 先做与查询侧一致的 NFKC 规范化（全半角/大小写），保证查询 token
     与文档 token 对称，全角查询也能命中半角语料。
+
+    P4 Lock 4 —— 加 bigram。纯 unigram 的中文 BM25 有个经典缺陷：词序信息
+    完全丢失，「安全」与「全安」的 token 集合完全相同因而同分，「网络代理」
+    与「代理网络」也无法区分。bigram 是**纯 stdlib** 就能拿到大部分收益的
+    方案，不给内网离线部署增加任何依赖。
+
+    bigram 只在**连续 CJK 片段内部**生成，不跨标点/拉丁字符组合，避免
+    「代理。配置」被拼出无意义的「理配」。
+
+    jieba 可用时额外叠加词典切分的长词（>2 字），进一步提升领域词精度；
+    不可用时静默跳过。
+
+    Returns:
+        token 列表，顺序为 [拉丁词..., CJK unigram..., CJK bigram..., jieba 长词...]。
+        保留重复项 —— BM25 需要词频。
     """
     text = normalize_query(text)
     tokens: list[str] = []
-    # Handle latin words + numbers
+    # 拉丁词 + 数字整词
     for w in _WORD_RE.findall(text):
         tokens.append(w)
-    # Handle CJK chars (char unigrams)
+    # CJK 单字 unigram（保底召回）
     for m in _CJK_RE.finditer(text):
         tokens.append(m.group(0))
+    # CJK bigram（词序/搭配精度），仅在连续汉字片段内部滑窗
+    if CJK_BIGRAM:
+        for run in _CJK_RUN_RE.findall(text):
+            for i in range(len(run) - 1):
+                tokens.append(run[i:i + 2])
+    # 可选：jieba 词典切分，补充 2 字以上的领域词
+    cut = _optional_jieba()
+    if cut is not None:
+        try:
+            for w in cut(text):
+                w = w.strip()
+                # 单字已由 unigram 覆盖、2 字已由 bigram 覆盖，这里只补更长的词
+                if len(w) > 2 and _CJK_RE.search(w):
+                    tokens.append(w)
+        except Exception:  # pragma: no cover - optional path
+            logger.debug("jieba tokenization failed; using bigram tokens only")
     return tokens
 
 
