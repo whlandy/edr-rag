@@ -35,8 +35,16 @@ logger = logging.getLogger(__name__)
 RRF_K = 60.0
 
 #: 开关: "0" -> 全局关闭精排；其它非空值或缺失 -> auto (可用即启用)。
-_ENV_RERANK = os.environ.get("EDR_RAG_RERANK", "").strip().lower()
-RERANK_ENABLED = _ENV_RERANK != "0"
+#:
+#: P4: 改为函数读取。旧实现在 import 时求值一次，运行时无法调整 ——
+#: 长跑的服务进程想临时关掉精排只能重启。``RERANK_ENABLED`` 作为模块级
+#: 常量保留（向后兼容既有 import），但检索链路统一走 ``rerank_enabled()``。
+RERANK_ENABLED = os.environ.get("EDR_RAG_RERANK", "").strip().lower() != "0"
+
+
+def rerank_enabled() -> bool:
+    """当前是否默认启用精排（每次读环境变量，支持运行时调整）。"""
+    return os.environ.get("EDR_RAG_RERANK", "").strip().lower() != "0"
 
 
 def rrf_fuse(
@@ -162,6 +170,34 @@ def available() -> bool:
     return _optional_reranker() is not None
 
 
+#: 精排文本的截断上限。cross-encoder 的输入窗口有限，但 120 字的 snippet
+#: 远远不够 —— P4 让检索结果携带 ``_rerank_text`` (更完整的正文)。
+RERANK_TEXT_MAX = int(os.environ.get("EDR_RAG_RERANK_TEXT_MAX", "1200"))
+
+
+def rerank_text_for(r: dict) -> str:
+    """取一条结果用于精排打分的文本。
+
+    P4 修复：旧实现按 ``text / content / title / snippet`` 取值，而 generic
+    语料的 ``_to_result`` 只产出 ``title`` 与 **120 字截断**的 ``snippet``。
+    cross-encoder 拿 120 字判相关性，收益接近噪声。
+
+    现在优先用 ``_rerank_text``（由 JsonlCorpus 注入的完整正文，见
+    p1/search.py），并把标题拼在前面 —— 标题往往是最强的相关性信号。
+    """
+    title = str(r.get("title") or r.get("_title") or "").strip()
+    body = str(
+        r.get("_rerank_text")
+        or r.get("text")
+        or r.get("content")
+        or r.get("snippet")
+        or ""
+    ).strip()
+    parts = [p for p in (title, body) if p]
+    text = " ".join(parts)
+    return text[:RERANK_TEXT_MAX]
+
+
 def rerank(
     query: str,
     results: list[dict],
@@ -169,14 +205,23 @@ def rerank(
 ) -> tuple[list[dict], bool]:
     """对检索结果做 cross-encoder 精排。
 
+    P4 修复（严重问题 7）：
+      1. **不再因个别空文本放弃整批**。旧实现是
+         ``if any(not t.strip() for t in texts): return results, False`` ——
+         候选池里只要有一条空文本（动作目录里标题为空的记录并不罕见），
+         整批精排就被跳过，reranker 形同虚设。现在只对有文本的条目精排，
+         无文本的按原相对顺序**排在已精排结果之后**（无法打分 != 相关）。
+      2. **用完整正文而非 120 字 snippet** 打分，见 ``rerank_text_for``。
+
     Args:
         query: 原始查询。
-        results: 检索结果 (dict 列表，需含可展示文本字段)。
+        results: 检索结果 (dict 列表)。
         enabled: 是否启用精排 (调用方开关)。默认 True。
 
     Returns:
         (reranked_results, did_rerank)。did_rerank=True 表示真正执行了
-        cross-encoder 精排；否则 (开关关闭或可选依赖缺失) 原顺序返回。
+        cross-encoder 精排；否则 (开关关闭 / 可选依赖缺失 / 全部无文本)
+        原顺序返回。
     """
     if not enabled or not results:
         return results, False
@@ -186,32 +231,41 @@ def rerank(
         logger.debug("P1-3 reranker unavailable; skipping cross-encoder rerank")
         return results, False
 
-    # 抽取每条的可展示文本用于打分，优先用富文本字段，回落到 title/snippet。
-    texts: list[str] = []
-    for r in results:
-        text = (
-            r.get("text")
-            or r.get("content")
-            or r.get("title")
-            or r.get("snippet")
-            or ""
-        )
-        texts.append(text)
+    # 分成「可打分」与「无文本」两组，保留各自原相对顺序。
+    scorable: list[tuple[int, dict, str]] = []
+    unscorable: list[tuple[int, dict]] = []
+    for i, r in enumerate(results):
+        text = rerank_text_for(r)
+        if text.strip():
+            scorable.append((i, r, text))
+        else:
+            unscorable.append((i, r))
 
-    # 空文本一律跳过精排 (无法打分)，保留原顺序。
-    if any(not t.strip() for t in texts):
+    if not scorable:
+        # 整批都没有可打分文本 —— 这时精排确实无从谈起。
+        logger.debug("no scorable text in candidate pool; skipping rerank")
         return results, False
 
     try:
-        scores = reranker(query, texts)
-        scored = sorted(
-            zip(results, scores), key=lambda pair: -pair[1]
-        )
-        out = [
-            {**r, "score": round(float(s), 4), "rerank_score": round(float(s), 4)}
-            for r, s in scored
-        ]
-        return out, True
+        scores = reranker(query, [t for _, _, t in scorable])
     except Exception:  # pragma: no cover - optional path only
         logger.warning("P1-3 cross-encoder rerank failed; skipping", exc_info=True)
         return results, False
+
+    if len(scores) != len(scorable):  # pragma: no cover - 防御性
+        logger.warning(
+            "reranker returned %d scores for %d candidates; skipping",
+            len(scores), len(scorable),
+        )
+        return results, False
+
+    ranked = sorted(
+        zip(scorable, scores), key=lambda pair: -float(pair[1])
+    )
+    out = [
+        {**r, "score": round(float(s), 4), "rerank_score": round(float(s), 4)}
+        for (_, r, _), s in ranked
+    ]
+    # 无法打分的条目缀在后面，保持它们之间的原有顺序。
+    out.extend(dict(r) for _, r in unscorable)
+    return out, True

@@ -460,6 +460,10 @@ class JsonlCorpus:
             logger.warning("vector_search failed; falling back to BM25", exc_info=True)
             return self.bm25_search(query, limit=limit)
 
+    #: 注入给 reranker 的正文上限。比 snippet 的 120 字长一个数量级，
+    #: 让 cross-encoder 有足够上下文判相关性 (P4 严重问题 7)。
+    RERANK_TEXT_MAX = 1200
+
     def _to_result(self, doc_idx: int, score: float) -> dict:
         r = self.records[doc_idx]
         return {
@@ -471,7 +475,15 @@ class JsonlCorpus:
                 "file": r.get("source_file", ""),
             },
             "snippet": self._snippet(r),
+            # 内部字段：仅供 rerank 打分，由 RetrievalService 在返回前剥掉。
+            # snippet 是给人看的 120 字摘要，不适合喂 cross-encoder。
+            "_rerank_text": self._rerank_text(r),
         }
+
+    def _rerank_text(self, r: dict) -> str:
+        """给 reranker 用的较完整正文（截断到 RERANK_TEXT_MAX）。"""
+        text = r.get("text") or r.get("content") or r.get("_searchable") or ""
+        return re.sub(r"\s+", " ", str(text)).strip()[: self.RERANK_TEXT_MAX]
 
     def _snippet(self, r: dict, max_len: int = 120) -> str:
         text = r.get("text") or r.get("content") or ""

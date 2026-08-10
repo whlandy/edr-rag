@@ -74,7 +74,7 @@ ANSWER_CONFLICT = "conflict"
 #: 证据不足拒答阈值：当没有足够命中条目，或综合置信度低于该值时，拒答而非编造。
 CONFIDENCE_REFUSE_THRESHOLD = 0.4
 
-#: 互斥操作对（同一目标出现相反操作 → 冲突）。
+#: 互斥操作对（同一目标出现相反操作 → 冲突）。P4 扩充覆盖面。
 _OPPOSITE_OPERATIONS: tuple[tuple[str, str], ...] = (
     ("enable", "disable"),
     ("启用", "禁用"),
@@ -86,7 +86,37 @@ _OPPOSITE_OPERATIONS: tuple[tuple[str, str], ...] = (
     ("放行", "阻断"),
     ("install", "uninstall"),
     ("安装", "卸载"),
+    # --- P4 新增：EDR 场景里高频且后果严重的互斥对 ---
+    ("add", "remove"),
+    ("添加", "移除"),
+    ("添加", "删除"),
+    ("create", "delete"),
+    ("新建", "删除"),
+    ("connect", "disconnect"),
+    ("连接", "断开"),
+    ("mount", "unmount"),
+    ("挂载", "卸载"),
+    ("上线", "下线"),
+    ("注册", "注销"),
+    ("加入", "退出"),
+    ("恢复", "隔离"),
+    ("信任", "阻断"),
+    ("白名单", "黑名单"),
+    ("grant", "revoke"),
+    ("授权", "撤销"),
+    ("resume", "suspend"),
+    ("恢复", "暂停"),
+    ("锁定", "解锁"),
+    ("lock", "unlock"),
+    ("显示", "隐藏"),
+    ("show", "hide"),
 )
+
+#: 版本/适用范围字段 —— 同一操作在不同版本下步骤不同是手册里最常见的真实冲突。
+_VERSION_KEYS = ("version", "product_version", "applies_to", "edition", "platform")
+
+#: 风险等级序数，用于判断「差异过大」。
+_RISK_ORDER = {"low": 0, "medium": 1, "high": 2}
 
 
 @dataclass
@@ -111,6 +141,8 @@ class SynthesizedAnswer:
     preconditions: list[str] = field(default_factory=list)
     citations: list[dict] = field(default_factory=list)
     confidence: float = 0.0
+    #: P4: 旧口径（抽取阶段静态 confidence 的均值），保留供审计对照。
+    extraction_confidence: float = 0.0
     requires_confirmation: bool = False
     generated_by: str = ASSEMBLE_MODE
     # P2-3: 答案状态 / 拒答原因 / 冲突列表
@@ -308,21 +340,111 @@ def _extract_citations(context: dict) -> list[dict]:
     return citations
 
 
-def _compute_confidence(context: dict) -> float:
-    """基于命中条目置信度 + 数量计算综合置信度。
+#: 综合置信度的分量权重 (P4 Lock 5)。缺失的分量会被剔除并重新归一化 ——
+#: 「没有该信号」不等于「该信号很差」。
+_CONFIDENCE_WEIGHTS = {
+    "extraction": 0.5,   # 抽取阶段写死的静态置信度
+    "retrieval": 0.3,    # 本次检索的质量（top-1 是否决定性胜出）
+    "evidence": 0.2,     # 证据量（命中条数）
+}
 
-    取所有命中条目的 confidence 均值；无命中则 0.0。
-    """
+#: 证据量饱和点：命中到这个条数就认为证据量充分。
+_EVIDENCE_SATURATION = 3
+
+
+def _extraction_confidence(context: dict) -> Optional[float]:
+    """抽取阶段的静态置信度均值；无标注返回 None。"""
     values: list[float] = []
-    for a in context.get("actions") or []:
-        if a.get("confidence") is not None:
-            values.append(float(a["confidence"]))
-    for p in context.get("procedures") or []:
-        if p.get("confidence") is not None:
-            values.append(float(p["confidence"]))
+    for key in ("actions", "procedures"):
+        for item in context.get(key) or []:
+            if item.get("confidence") is not None:
+                try:
+                    values.append(float(item["confidence"]))
+                except (TypeError, ValueError):
+                    continue
     if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def _retrieval_confidence(context: dict) -> Optional[float]:
+    """本次检索的质量信号；结果不带分数时返回 None。
+
+    用 **top-1 相对 top-2 的领先幅度**（margin）而不是分数绝对值 —— 各策略
+    的分数量纲完全不同（keyword 是词频计数、bm25 是 idf 加权、rrf_score 在
+    0.03 量级、rerank_score 是 logit），绝对值之间没有可比性，margin 是
+    scale-free 的。
+
+    语义：
+      - 没有正分命中            -> 0.0（检索没找到相关的东西）
+      - 只有一条命中            -> 0.75（决定性，但没有对照）
+      - top1 远超 top2          -> 接近 1.0
+      - top1 与 top2 难分伯仲   -> 接近 0.5（检索本身也不确定选哪个）
+    """
+    scores: list[float] = []
+    for key in ("actions", "procedures", "sections"):
+        for item in context.get(key) or []:
+            raw = item.get("rerank_score")
+            if raw is None:
+                raw = item.get("score")
+            if raw is None:
+                continue
+            try:
+                scores.append(float(raw))
+            except (TypeError, ValueError):
+                continue
+    if not scores:
+        return None
+    scores.sort(reverse=True)
+    top1 = scores[0]
+    if top1 <= 0:
         return 0.0
-    return round(sum(values) / len(values), 3)
+    if len(scores) == 1:
+        return 0.75
+    top2 = scores[1]
+    margin = (top1 - max(top2, 0.0)) / top1
+    margin = min(max(margin, 0.0), 1.0)
+    return 0.5 + 0.5 * margin
+
+
+def _evidence_confidence(context: dict) -> float:
+    """证据量分量：命中条数的饱和函数。"""
+    count = len(context.get("actions") or []) + len(context.get("procedures") or [])
+    return min(1.0, count / _EVIDENCE_SATURATION)
+
+
+def _compute_confidence(context: dict) -> float:
+    """综合置信度 —— 抽取置信度 + 检索质量 + 证据量的加权平均 (P4 Lock 5)。
+
+    P0–P3 的实现只取命中条目 ``confidence`` 静态字段的**算术平均**，与本次
+    检索的质量完全无关。而「证据不足拒答」的阈值就建在这个数上 —— 也就是说
+    拒答判定其实不看检索好不好，只看抽取阶段写死的字段。两个后果：
+
+      1. 检索到一堆不相关但 confidence 标得很高的动作 -> 照样自信作答。
+      2. 一条高置信 + 一条低置信被平均稀释 -> 明明有确凿证据却拒答。
+
+    现在三个分量都参与，缺失的分量剔除后重新归一化（「没有该信号」不等于
+    「该信号很差」——这对没有 score 的调用方保持向后兼容）。
+
+    ``SynthesizedAnswer.extraction_confidence`` 保留旧口径供审计对照。
+    """
+    parts: list[tuple[float, float]] = []
+
+    extraction = _extraction_confidence(context)
+    if extraction is not None:
+        parts.append((_CONFIDENCE_WEIGHTS["extraction"], extraction))
+
+    retrieval = _retrieval_confidence(context)
+    if retrieval is not None:
+        parts.append((_CONFIDENCE_WEIGHTS["retrieval"], retrieval))
+
+    parts.append((_CONFIDENCE_WEIGHTS["evidence"], _evidence_confidence(context)))
+
+    total_weight = sum(w for w, _ in parts)
+    if total_weight <= 0:  # pragma: no cover - 权重常量恒为正
+        return 0.0
+    blended = sum(w * v for w, v in parts) / total_weight
+    return round(min(max(blended, 0.0), 1.0), 3)
 
 
 def _compute_requires_confirmation(context: dict) -> bool:
@@ -445,10 +567,12 @@ def _detect_conflicts(ctx: dict) -> list[dict]:
                 "sources": sources,
             })
 
-    # 风险矛盾：同一标题出现 low 与 high 两种风险
+    # 风险矛盾：同一标题的风险等级跨度 >= 2 级（low vs high）
     for title, risks in title_risks.items():
-        levels = {r for r, _ in risks if r in ("low", "high")}
-        if {"low", "high"} <= levels:
+        levels = {
+            _RISK_ORDER[r] for r, _ in risks if r in _RISK_ORDER
+        }
+        if levels and (max(levels) - min(levels)) >= 2:
             sources = [src for _, src in risks]
             conflicts.append({
                 "type": "risk_contradiction",
@@ -456,6 +580,83 @@ def _detect_conflicts(ctx: dict) -> list[dict]:
                 "sources": sources,
             })
 
+    # P4 新增：版本/适用范围分歧。手册里最常见的**真实**冲突不是「启用 vs
+    # 禁用」这种教科书式互斥，而是「V5 这么做、V6 那么做」——旧实现完全
+    # 检测不到，会把两个版本的步骤混在一起给用户。
+    conflicts.extend(_detect_version_conflicts(items))
+
+    # P4 新增：同一操作的步骤数差异过大。同名操作一个 3 步一个 9 步，
+    # 通常意味着命中了两份不同的文档（不同版本/不同产品线）。
+    conflicts.extend(_detect_step_count_conflicts(items))
+
+    return conflicts
+
+
+def _item_version(it: dict) -> str:
+    """读取一条记录声明的版本/适用范围（顶层或 metadata 内嵌）。"""
+    for key in _VERSION_KEYS:
+        val = it.get(key)
+        if val:
+            return str(val).strip()
+    meta = it.get("metadata")
+    if isinstance(meta, dict):
+        for key in _VERSION_KEYS:
+            val = meta.get(key)
+            if val:
+                return str(val).strip()
+    return ""
+
+
+def _detect_version_conflicts(items: list[dict]) -> list[dict]:
+    """同一操作标题下出现多个不同版本/适用范围 → 需要澄清 (P4)。"""
+    by_title: dict[str, list[tuple[str, dict]]] = {}
+    for it in items:
+        title = str(it.get("title") or "").strip()
+        version = _item_version(it)
+        if title and version:
+            by_title.setdefault(title, []).append((version, _resolve_source(it)))
+
+    conflicts: list[dict] = []
+    for title, pairs in by_title.items():
+        versions = {v for v, _ in pairs}
+        if len(versions) > 1:
+            conflicts.append({
+                "type": "version_divergence",
+                "description": (
+                    f"操作「{title}」在不同版本/适用范围下步骤可能不同："
+                    + "、".join(sorted(versions))
+                    + "。请确认目标环境的版本后再执行。"
+                ),
+                "sources": [src for _, src in pairs],
+            })
+    return conflicts
+
+
+def _detect_step_count_conflicts(items: list[dict]) -> list[dict]:
+    """同名操作的步骤数差异过大 → 大概率命中了两份不同文档 (P4)。"""
+    by_title: dict[str, list[tuple[int, dict]]] = {}
+    for it in items:
+        title = str(it.get("title") or "").strip()
+        steps = it.get("procedure") or []
+        if title and isinstance(steps, list) and steps:
+            by_title.setdefault(title, []).append((len(steps), _resolve_source(it)))
+
+    conflicts: list[dict] = []
+    for title, pairs in by_title.items():
+        counts = [n for n, _ in pairs]
+        if len(counts) < 2:
+            continue
+        lo, hi = min(counts), max(counts)
+        # 阈值：多出一倍且至少差 3 步 —— 避免把「多一步确认」误报成冲突。
+        if hi >= lo * 2 and (hi - lo) >= 3:
+            conflicts.append({
+                "type": "step_count_divergence",
+                "description": (
+                    f"操作「{title}」在不同来源中的步骤数差异过大"
+                    f"（{lo} 步 vs {hi} 步），可能来自不同版本或不同产品线的手册。"
+                ),
+                "sources": [src for _, src in pairs],
+            })
     return conflicts
 
 
@@ -631,6 +832,7 @@ def synthesize_answer(
 
     citations = _extract_citations(ctx)
     confidence = _compute_confidence(ctx)
+    extraction_confidence = round(_extraction_confidence(ctx) or 0.0, 3)
     requires_confirmation = _compute_requires_confirmation(ctx)
 
     # P2-3: 证据充分性 + 冲突检测
@@ -691,6 +893,7 @@ def synthesize_answer(
         preconditions=uniq_pre,
         citations=citations,
         confidence=confidence,
+        extraction_confidence=extraction_confidence,
         requires_confirmation=requires_confirmation,
         generated_by=generated_by,
         answer_status=answer_status,

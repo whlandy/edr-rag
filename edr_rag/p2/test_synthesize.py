@@ -50,7 +50,10 @@ def test_synthesize_extracts_structured_fields():
     assert result.preconditions == ["具备网络管理员权限", "已打开网络设置"]
     assert any("代理" in w or "确认" in w for w in result.warnings)
     assert result.requires_confirmation is True
-    assert result.confidence == 0.85
+    # P4 Lock 5: confidence 现在是「抽取置信度 + 检索质量 + 证据量」的加权
+    # 综合值；抽取阶段的旧口径保留在 extraction_confidence 里供审计。
+    assert result.extraction_confidence == 0.85
+    assert 0.0 < result.confidence <= 1.0
     assert len(result.citations) == 1
     assert result.citations[0]["id"] == "网络.代理.配置代理服务器"
 

@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .p1.search import JsonlCorpus
-from .rerank import rrf_fuse, rerank, RERANK_ENABLED
+from .rerank import rrf_fuse, rerank, rerank_enabled as _rerank_default
 from .security import ACLPolicy, acl_allows
 
 # 允许的 corpus_type -> 对应 JSONL 文件名
@@ -163,7 +163,17 @@ class RetrievalService:
 
     # ---------- 搜索 ----------
 
-    def search(
+    def search(self, *args, **kwargs) -> list[dict]:
+        """统一检索入口（对外）。
+
+        这是一层薄包装：真正的检索在 ``_search_impl``，这里只负责在返回前
+        剥掉内部字段（以 ``_`` 开头，如 ``_rerank_text``）。内部字段是检索
+        链路自己用的（例如喂给 cross-encoder 的完整正文），不该出现在
+        API / MCP / CLI 的响应里。
+        """
+        return _strip_internal_fields(self._search_impl(*args, **kwargs))
+
+    def _search_impl(
         self,
         query: str,
         corpus_type: str = "actions",
@@ -207,7 +217,8 @@ class RetrievalService:
         top_k = max(int(top_k), 0)
         requested_top_k = top_k
         recall_budget = max(int(recall_budget), 1)
-        rerank_enabled = RERANK_ENABLED if rerank is None else bool(rerank)
+        # P4: 每次读环境变量而非 import 时求值一次，支持运行时调整。
+        rerank_enabled = _rerank_default() if rerank is None else bool(rerank)
 
         # ACL must participate in recall, not merely filter an already
         # truncated top-k result.  The current local stores cannot push an ACL
@@ -863,6 +874,22 @@ class RetrievalService:
             result["sections"] = []
 
         return result
+
+
+def _strip_internal_fields(results: list[dict]) -> list[dict]:
+    """剥掉检索结果里的内部字段（``_`` 前缀），返回对外形状 (P4)。
+
+    目前只有 ``_rerank_text``（喂给 cross-encoder 的完整正文）。它必须
+    存在于检索链路内部、但不能出现在响应里 —— 否则每条结果都要多带
+    上千字符的正文，MCP / HTTP 响应体会膨胀一个数量级。
+    """
+    out: list[dict] = []
+    for r in results:
+        if any(k.startswith("_") for k in r):
+            out.append({k: v for k, v in r.items() if not k.startswith("_")})
+        else:
+            out.append(r)
+    return out
 
 
 # ---------- 过滤辅助 ----------
