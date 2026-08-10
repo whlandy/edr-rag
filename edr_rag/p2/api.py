@@ -264,6 +264,10 @@ class EdrRagAPI:
         # 检索返回的动作结果是薄形状（无 procedure/preconditions/recovery），
         # 用全量动作记录补全，让合成器能输出完整步骤/前置条件/注意事项。
         context = _enrich_action_details(self._service, context)
+        # P4: 调用方没显式注入 llm 时，若运维配置了生成端点就用它；
+        # 未配置则 llm 保持 None，走 P2 的确定性组装路径。
+        if llm is None:
+            llm = _configured_llm_callable()
         return synthesize_answer(
             user_request,
             context,
@@ -335,6 +339,28 @@ class EdrRagAPI:
         from . import confirmation as confirm_mod
 
         return confirm_mod.gate_answer(result, confirm=bool(confirm))
+
+
+def _configured_llm_callable() -> Optional[Callable]:
+    """若运维配置了生成端点，返回适配好的 llm callable；否则 None (P4)。
+
+    「配置了端点」是运维表达「我要用 LLM 生成」的唯一信号 —— 没配就走确定性
+    组装路径，行为与 P2 完全一致，保证升级到 P4 不会让既有部署突然开始调模型。
+    """
+    try:
+        from ..llm import get_llm_client, make_synthesize_callable
+
+        client = get_llm_client()
+        if client is None:
+            return None
+        return make_synthesize_callable(client)
+    except Exception:  # pragma: no cover - 生成侧故障绝不影响检索
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "LLM client unavailable; using assembly path", exc_info=True
+        )
+        return None
 
 
 def _augment_ask_answer(result: dict) -> dict:
