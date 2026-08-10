@@ -373,13 +373,25 @@ class JsonlCorpus:
         total = sum(self._doc_len)
         self._avgdl = total / len(self._doc_len) if self._doc_len else 0.0
 
-    def keyword_search(self, query: str, limit: int = 5) -> list[dict]:
-        """Simple substring / token-overlap scoring."""
+    def keyword_search(
+        self,
+        query: str,
+        limit: int = 5,
+        allowed: Optional[set[int]] = None,
+    ) -> list[dict]:
+        """Simple substring / token-overlap scoring.
+
+        Args:
+            allowed: 允许参与打分的行号集合 (ACL 谓词下推，P4)。None = 不限制。
+                越权文档在**打分前**就被排除，而不是打完分再过滤。
+        """
         q_tokens = tokenize(query)
         if not q_tokens:
             return []
         scores: list[tuple[float, int]] = []
         for i, r in enumerate(self.records):
+            if allowed is not None and i not in allowed:
+                continue
             field = r["_searchable"]
             score = 0.0
             for t in q_tokens:
@@ -392,7 +404,15 @@ class JsonlCorpus:
         scores.sort(key=lambda x: -x[0])
         return [self._to_result(i, s) for s, i in scores[:limit]]
 
-    def bm25_search(self, query: str, limit: int = 5, k1: float = 1.5, b: float = 0.75) -> list[dict]:
+    def bm25_search(
+        self,
+        query: str,
+        limit: int = 5,
+        k1: float = 1.5,
+        b: float = 0.75,
+        allowed: Optional[set[int]] = None,
+    ) -> list[dict]:
+        """BM25 打分。``allowed`` 为 ACL 允许的行号集合 (谓词下推，P4)。"""
         q_tokens = set(tokenize(query))
         if not q_tokens:
             return []
@@ -407,6 +427,8 @@ class JsonlCorpus:
             if idf == 0:
                 continue
             for doc_idx, tf in self._postings.get(t, []):
+                if allowed is not None and doc_idx not in allowed:
+                    continue
                 dl = self._doc_len[doc_idx]
                 tf_norm = (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * (dl / self._avgdl))) if self._avgdl else 0.0
                 scores[doc_idx] = scores.get(doc_idx, 0.0) + idf * tf_norm
@@ -418,6 +440,7 @@ class JsonlCorpus:
         query: str,
         limit: int = 5,
         filter: Optional[dict[str, Any]] = None,
+        allowed: Optional[set[int]] = None,
     ) -> list[dict]:
         """Embedding-based retrieval via the pluggable vector store (P3-1).
 
@@ -437,7 +460,7 @@ class JsonlCorpus:
         if embed_fn is None:
             # Degrade to BM25 when LlamaIndex / embedding model is absent —
             # main chain stays green without the optional deps.
-            return self.bm25_search(query, limit=limit)
+            return self.bm25_search(query, limit=limit, allowed=allowed)
 
         try:
             index = _get_shared_index(
@@ -454,11 +477,15 @@ class JsonlCorpus:
             # (常见路径) 不做任何 IO。
             if indexed and self.vector_dir is not None:
                 index.persist()
-            hits = index.search(query, top_k=limit, filter=filter)
-            return [self._to_result(doc_idx, score) for score, doc_idx in hits]
+            # ACL 受限时多召回一些，抵消随后按行号过滤造成的损耗。
+            fetch = limit if allowed is None else max(limit * 4, limit)
+            hits = index.search(query, top_k=fetch, filter=filter)
+            if allowed is not None:
+                hits = [(s_, i) for s_, i in hits if i in allowed]
+            return [self._to_result(doc_idx, score) for score, doc_idx in hits[:limit]]
         except Exception:  # pragma: no cover - optional path only
             logger.warning("vector_search failed; falling back to BM25", exc_info=True)
-            return self.bm25_search(query, limit=limit)
+            return self.bm25_search(query, limit=limit, allowed=allowed)
 
     #: 注入给 reranker 的正文上限。比 snippet 的 120 字长一个数量级，
     #: 让 cross-encoder 有足够上下文判相关性 (P4 严重问题 7)。

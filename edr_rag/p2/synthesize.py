@@ -149,6 +149,9 @@ class SynthesizedAnswer:
     answer_status: str = ANSWER_ANSWERED
     refusal_reason: Optional[str] = None
     conflicts: list[dict] = field(default_factory=list)
+    #: P4: 命中记录里检出的疑似 prompt injection 信号
+    #: [{id, reasons}]，供运维审计与告警。空表示未检出。
+    injection_flags: list[dict] = field(default_factory=list)
 
     def to_jsonl(self) -> dict:
         return asdict(self)
@@ -754,6 +757,75 @@ def _assemble_answer(
     return "\n".join(lines)
 
 
+# ---------- P4: 全路径注入清洗 ----------
+
+
+def _sanitize_text(text: Any) -> str:
+    """对单条文本做注入清洗（P4 严重问题 8）。"""
+    from ..security import sanitize_document_text
+
+    return sanitize_document_text(text if isinstance(text, str) else str(text or ""))
+
+
+def _sanitize_structured(
+    steps: list[dict],
+    warnings: list[str],
+    preconditions: list[str],
+    assertions: list[dict],
+) -> tuple[list[dict], list[str], list[str], list[dict]]:
+    """清洗所有会流向下游的结构化文本字段。
+
+    P3-3 只在「传了 llm 且 sanitize=True」时清洗喂给模型的上下文；**组装
+    路径完全不过滤**。但组装出来的答案并不是终点 —— 它被返回给
+    agent/规划器，而 agent 本身就是一个 LLM。也就是说被投毒的手册文本
+    照样能一路走到某个模型的上下文里，只是绕了一圈。
+
+    现在两条路径都清洗。清洗是幂等的，对正常文本零影响。
+    """
+    clean_steps = []
+    for st in steps:
+        s2 = dict(st)
+        for key in ("instruction", "action", "target"):
+            if key in s2:
+                s2[key] = _sanitize_text(s2[key])
+        clean_steps.append(s2)
+    clean_warnings = [_sanitize_text(w) for w in warnings]
+    clean_pre = [_sanitize_text(p) for p in preconditions]
+    clean_assertions = []
+    for a in assertions:
+        a2 = dict(a)
+        a2["text"] = _sanitize_text(a2.get("text", ""))
+        clean_assertions.append(a2)
+    return clean_steps, clean_warnings, clean_pre, clean_assertions
+
+
+def _collect_injection_flags(ctx: dict) -> list[dict]:
+    """扫描命中记录，记录疑似注入信号供审计 (P4)。"""
+    from ..security import detect_prompt_injection
+
+    flags: list[dict] = []
+    seen: set[str] = set()
+    for key in ("actions", "procedures", "sections"):
+        for item in ctx.get(key) or []:
+            if not isinstance(item, dict):
+                continue
+            ident = str(item.get("id") or item.get("action_id") or "")
+            if ident in seen:
+                continue
+            blob = " ".join(
+                str(item.get(f) or "")
+                for f in ("title", "snippet", "text", "content")
+            )
+            for st in item.get("procedure") or []:
+                if isinstance(st, dict):
+                    blob += " " + str(st.get("source_instruction") or "")
+            verdict = detect_prompt_injection(blob)
+            if verdict.flagged:
+                seen.add(ident)
+                flags.append({"id": ident, "reasons": verdict.reasons})
+    return flags
+
+
 # ---------- 对外主入口 ----------
 
 
@@ -830,6 +902,15 @@ def synthesize_answer(
         seen_a.add(a["text"])
         uniq_assertions.append(a)
 
+    # P4 (严重问题 8): 无论走 LLM 还是组装路径，都清洗结构化文本字段。
+    # 组装出的答案会被 agent/规划器消费，而 agent 本身就是 LLM——不清洗
+    # 等于给注入内容留了一条绕行路径。
+    if sanitize:
+        unique_steps, uniq_warnings, uniq_pre, uniq_assertions = _sanitize_structured(
+            unique_steps, uniq_warnings, uniq_pre, uniq_assertions
+        )
+    injection_flags = _collect_injection_flags(ctx) if sanitize else []
+
     citations = _extract_citations(ctx)
     confidence = _compute_confidence(ctx)
     extraction_confidence = round(_extraction_confidence(ctx) or 0.0, 3)
@@ -899,6 +980,7 @@ def synthesize_answer(
         answer_status=answer_status,
         refusal_reason=refusal_reason,
         conflicts=conflicts,
+        injection_flags=injection_flags,
     )
 
 

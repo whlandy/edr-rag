@@ -117,6 +117,8 @@ class RetrievalService:
         # [keyword, bm25, vector(如可用)]；None 表示等权。
         # 由评测集调节 (edr_rag/eval/tune.py) 或直接 set_fusion_weights 设置。
         self.fusion_weights: list[float] | None = None
+        # P4: (corpus_type, 文件签名, acl 指纹) -> 允许行号集合。
+        self._acl_cache: dict[tuple, set[int]] = {}
 
     def set_fusion_weights(self, weights: list[float] | None) -> None:
         """设置 hybrid 的 RRF 融合权重（顺序 keyword/bm25/vector）。
@@ -160,6 +162,86 @@ class RetrievalService:
         corpus = JsonlCorpus.from_file(path)
         self._corpora[corpus_type] = (sig, corpus)
         return corpus
+
+    # ---------- ACL 谓词下推 (P4) ----------
+
+    def _acl_fingerprint(self, acl: ACLPolicy) -> tuple:
+        """把 ACLPolicy 归一成可哈希的缓存键。"""
+        return (
+            tuple(sorted(map(str, acl.tenants))) if acl.tenants else None,
+            tuple(sorted(map(str, acl.devices))) if acl.devices else None,
+            bool(acl.restrict_unlabeled),
+        )
+
+    def _acl_allowed_rows(
+        self,
+        corpus_type: str,
+        acl: Optional[ACLPolicy],
+    ) -> Optional[set[int]]:
+        """返回该策略下允许可见的语料行号集合；不受限时返回 None。
+
+        结果按 (corpus 文件签名, acl 指纹) 缓存 —— 同一个调用方连续查询
+        不必反复遍历整个语料判权限。语料文件变化时签名变，缓存自动失效。
+
+        Returns:
+            允许的行号集合；None 表示不限制（调用方据此跳过全部过滤逻辑）。
+            空集合表示「一条都看不到」，调用方应直接短路。
+        """
+        if acl is None or acl.unrestricted:
+            return None
+        corpus = self._corpus(corpus_type)
+        if corpus is None:
+            return set()
+        sig = _file_signature(self.workdir / _CORPUS_FILES[corpus_type])
+        key = (corpus_type, sig, self._acl_fingerprint(acl))
+        cached = self._acl_cache.get(key)
+        if cached is not None:
+            return cached
+        allowed = {
+            i for i, rec in enumerate(corpus.records) if acl.allows(rec)
+        }
+        # 只保留最近若干份，避免多租户场景把缓存撑爆。
+        if len(self._acl_cache) >= 32:
+            self._acl_cache.clear()
+        self._acl_cache[key] = allowed
+        return allowed
+
+    def _allowed_node_ids(self, acl: Optional[ACLPolicy]) -> Optional[set[str]]:
+        """返回 ACL 允许可见的结构化节点 id 集合；不受限时 None (P4)。"""
+        if acl is None or acl.unrestricted:
+            return None
+        return {
+            str(n.get("id"))
+            for n in self._load_nodes()
+            if n.get("id") and acl.allows(n)
+        }
+
+    @staticmethod
+    def _scrub_node_refs(nodes: list[dict], allowed_ids: set[str]) -> list[dict]:
+        """过滤越权节点，并抹掉指向它们的**悬空引用** (P4)。
+
+        只过滤节点本身是不够的：一个被授权的父节点，它的 ``children`` 数组
+        里仍然列着越权子节点的 id；``prev_id`` / ``next_id`` 同理。内容虽然
+        没泄露，但 **id 本身就是信息** —— 它告诉调用方「这里还存在一个你看
+        不到的步骤」，暴露了受限文档的存在性与数量。
+
+        所以过滤之后要把所有跨界引用一并清掉，让受限视图看起来是自洽的。
+        """
+        out: list[dict] = []
+        for n in nodes:
+            if str(n.get("id")) not in allowed_ids:
+                continue
+            n2 = dict(n)
+            for key in ("parent_id", "prev_id", "next_id"):
+                if n2.get(key) and str(n2[key]) not in allowed_ids:
+                    n2[key] = ""
+            children = n2.get("children")
+            if isinstance(children, list):
+                n2["children"] = [
+                    c for c in children if str(c) in allowed_ids
+                ]
+            out.append(n2)
+        return out
 
     # ---------- 搜索 ----------
 
@@ -220,20 +302,26 @@ class RetrievalService:
         # P4: 每次读环境变量而非 import 时求值一次，支持运行时调整。
         rerank_enabled = _rerank_default() if rerank is None else bool(rerank)
 
-        # ACL must participate in recall, not merely filter an already
-        # truncated top-k result.  The current local stores cannot push an ACL
-        # predicate into every strategy, so conservatively rank the complete
-        # corpus and trim only after authorization.  Backends with native
-        # metadata filtering can replace this fallback later.
+        # P4 (严重问题 6): ACL 谓词下推。
+        #
+        # P3-3 的做法是「先按全语料召回、再过滤」——受限查询会把 top_k 撑到
+        # len(corpus.records)，于是整个语料都要打分，hybrid 下还要整个语料过一遍
+        # cross-encoder 精排。受限租户的查询延迟随语料线性增长，正好惩罚了权限
+        # 最小的那批用户。
+        #
+        # 现在先算出该策略下**允许可见的行号集合**（每个 (corpus, acl) 只算一次
+        # 并缓存），把它下推给各路召回，越权文档根本不参与打分与精排。
+        # top_k 保持调用方请求的值。
         acl_restricted = acl is not None and not acl.unrestricted
-        if acl_restricted:
-            corpus = self._corpus(corpus_type)
-            top_k = len(corpus.records) if corpus is not None else 0
+        allowed = self._acl_allowed_rows(corpus_type, acl) if acl_restricted else None
+        if allowed is not None and not allowed:
+            # 该策略下没有任何可见文档，直接短路。
+            return []
 
-        # Context expansion can include neighbouring records that have not
-        # independently passed ACL checks. Disable it for restricted queries
-        # until context assembly becomes ACL-aware.
-        safe_with_context = with_context and not acl_restricted
+        # 上下文补全现在是 ACL 感知的：只把允许可见的节点喂给 assemble_context，
+        # 于是父/兄弟/窗口都只可能引用到已授权的节点。P3-3 是直接关掉补全
+        # （受限用户功能降级），P4 不再需要那样。
+        safe_with_context = with_context
 
         # 精确 id 获取模式：不做全文打分，直接按主键取。
         if filters.get("id") is not None:
@@ -271,7 +359,7 @@ class RetrievalService:
                     variants[0] if variants else query,
                     corpus_type, strategy, filters,
                     top_k, recall_budget, rerank_enabled,
-                    safe_with_context, adjacency,
+                    safe_with_context, adjacency, allowed, acl,
                 ),
                 acl,
             )[:requested_top_k]
@@ -284,7 +372,7 @@ class RetrievalService:
             res = self._search_single(
                 v, corpus_type, strategy, filters,
                 top_k, recall_budget, rerank_enabled,
-                False, adjacency,
+                False, adjacency, allowed, acl,
             )
             if res:
                 per_variant.append(res)
@@ -292,7 +380,7 @@ class RetrievalService:
             return []
         fused = rrf_fuse(per_variant, weights=variant_weights)
         if safe_with_context and corpus_type == "nodes" and fused:
-            fused = self._enrich_with_context(fused, adjacency=adjacency)
+            fused = self._enrich_with_context(fused, adjacency=adjacency, acl=acl)
         # P3-3: 多查询融合后同样应用文档级 ACL 过滤。
         return self._filter_acl_corpus(corpus_type, fused, acl)[:requested_top_k]
 
@@ -341,8 +429,13 @@ class RetrievalService:
         rerank_enabled: bool,
         with_context: bool,
         adjacency: int,
+        allowed: Optional[set[int]] = None,
+        acl: Optional[ACLPolicy] = None,
     ) -> list[dict]:
-        """对单个查询执行检索（keyword/bm25/vector/hybrid），供 search 分发。"""
+        """对单个查询执行检索（keyword/bm25/vector/hybrid），供 search 分发。
+
+        ``allowed`` 是 ACL 允许的行号集合 (P4 谓词下推)；None 表示不限制。
+        """
 
         if strategy == "hybrid":
             results = self._search_hybrid(
@@ -352,9 +445,12 @@ class RetrievalService:
                 top_k=top_k,
                 recall_budget=recall_budget,
                 rerank_enabled=rerank_enabled,
+                allowed=allowed,
             )
             if with_context and corpus_type == "nodes" and results:
-                results = self._enrich_with_context(results, adjacency=adjacency)
+                results = self._enrich_with_context(
+                    results, adjacency=adjacency, acl=acl
+                )
             return results
 
         if corpus_type == "actions":
@@ -364,17 +460,18 @@ class RetrievalService:
                 filters=filters,
                 top_k=top_k,
                 recall_budget=recall_budget,
+                allowed=allowed,
             )
         else:
             corpus = self._corpus(corpus_type)
             if corpus is None:
                 return []
-            results = self._search_generic(corpus, query, strategy, top_k)
+            results = self._search_generic(corpus, query, strategy, top_k, allowed)
             results = _apply_filter(results, filters)
 
         # P1-4: 结构化节点语料的上下文补全（仅 nodes 语料、且 with_context=True）
         if with_context and corpus_type == "nodes" and results:
-            results = self._enrich_with_context(results, adjacency=adjacency)
+            results = self._enrich_with_context(results, adjacency=adjacency, acl=acl)
 
         return results
 
@@ -395,6 +492,7 @@ class RetrievalService:
         filters: dict[str, Any],
         top_k: int,
         recall_budget: int = 4,
+        allowed: Optional[set[int]] = None,
     ) -> list[dict]:
         """动作目录检索，输出富字段结果。
 
@@ -410,11 +508,11 @@ class RetrievalService:
         corpus = self._corpus("actions")
         if corpus is None:
             return []
-        total = len(corpus.records)
+        total = len(corpus.records) if allowed is None else len(allowed)
         budget = max(top_k * recall_budget, top_k)
 
         while True:
-            scored = self._score_actions(corpus, query, strategy, budget)
+            scored = self._score_actions(corpus, query, strategy, budget, allowed)
             filtered = _apply_filter(scored, filters, action_shape=True)
             if len(filtered) >= top_k or budget >= total:
                 break
@@ -432,6 +530,7 @@ class RetrievalService:
         top_k: int,
         recall_budget: int,
         rerank_enabled: bool,
+        allowed: Optional[set[int]] = None,
     ) -> list[dict]:
         """hybrid 完整流程。
 
@@ -449,9 +548,11 @@ class RetrievalService:
 
         if corpus_type == "actions":
             return self._search_actions_hybrid(
-                corpus, query, filters, top_k, recall_budget, rerank_enabled
+                corpus, query, filters, top_k, recall_budget, rerank_enabled, allowed
             )
-        return self._search_generic_hybrid(corpus, query, filters, top_k, rerank_enabled)
+        return self._search_generic_hybrid(
+            corpus, query, filters, top_k, rerank_enabled, allowed
+        )
 
     def _embedder_available(self) -> bool:
         """embedding 是否可用 (用于决定 hybrid 是否叠加 vector 一路召回)。"""
@@ -466,22 +567,23 @@ class RetrievalService:
         filters: dict[str, Any],
         top_k: int,
         rerank_enabled: bool,
+        allowed: Optional[set[int]] = None,
     ) -> list[dict]:
         """generic 语料 (sections/procedures/chunks) 的融合检索。"""
         # 每路召回带上限 (top_k * 固定倍数)，保证融合候选池有足够区分度。
         recall_cap = max(top_k * 4, top_k)
 
         lists: list[list[dict]] = []
-        kw = corpus.keyword_search(query, limit=recall_cap)
+        kw = corpus.keyword_search(query, limit=recall_cap, allowed=allowed)
         if kw:
             lists.append(kw)
-        bm = corpus.bm25_search(query, limit=recall_cap)
+        bm = corpus.bm25_search(query, limit=recall_cap, allowed=allowed)
         if bm:
             lists.append(bm)
         # 有 embedder 时叠加 vector 一路；缺依赖时 vector 会降级成 bm25，
         # 为避免重复计数同一信号，仅在 embedder 真实可用时纳入。
         if self._embedder_available():
-            vec = corpus.vector_search(query, limit=recall_cap)
+            vec = corpus.vector_search(query, limit=recall_cap, allowed=allowed)
             if vec:
                 lists.append(vec)
 
@@ -500,14 +602,15 @@ class RetrievalService:
         top_k: int,
         recall_budget: int,
         rerank_enabled: bool,
+        allowed: Optional[set[int]] = None,
     ) -> list[dict]:
         """actions 的融合检索，保留 P0-4 召回预算 + metadata 过滤循环。"""
-        total = len(corpus.records)
+        total = len(corpus.records) if allowed is None else len(allowed)
         budget = max(top_k * recall_budget, top_k)
 
         filtered: list[dict] = []
         while True:
-            fused = self._hybrid_score_actions(corpus, query, budget)
+            fused = self._hybrid_score_actions(corpus, query, budget, allowed)
             filtered = _apply_filter(fused, filters, action_shape=True)
             if len(filtered) >= top_k or budget >= total:
                 break
@@ -521,6 +624,7 @@ class RetrievalService:
         corpus: JsonlCorpus,
         query: str,
         budget: int,
+        allowed: Optional[set[int]] = None,
     ) -> list[dict]:
         """对动作语料做多路召回并 RRF 融合，返回前 `budget` 个候选富字段结果。
 
@@ -530,18 +634,18 @@ class RetrievalService:
         """
         lists: list[list[dict]] = []
 
-        kw = self._keyword_actions(corpus, query, budget)
+        kw = self._keyword_actions(corpus, query, budget, allowed)
         if kw:
             lists.append(kw)
 
-        bm_pairs = self._bm25_rank(corpus, query)[:budget]
+        bm_pairs = self._bm25_rank(corpus, query, allowed)[:budget]
         if bm_pairs:
             lists.append([self._action_result(corpus, i, s) for s, i in bm_pairs])
 
         # 仅为避免重复 bm25 (vector 缺依赖降级) 才只叠加一路；embedder 可用
         # 时 vector 提供独立的语义信号。
         if self._embedder_available():
-            vec_pairs = self._vector_rank(corpus, query)[:budget]
+            vec_pairs = self._vector_rank(corpus, query, allowed=allowed)[:budget]
             if vec_pairs:
                 lists.append([self._action_result(corpus, i, s) for s, i in vec_pairs])
 
@@ -555,6 +659,7 @@ class RetrievalService:
         query: str,
         strategy: str,
         budget: int,
+        allowed: Optional[set[int]] = None,
     ) -> list[dict]:
         """对语料打分排序，返回前 `budget` 个命中的动作富字段结果。
 
@@ -563,15 +668,23 @@ class RetrievalService:
         保证所有策略都能做一致的 metadata 过滤 (P0-4)。
         """
         if strategy == "bm25":
-            pairs = self._bm25_rank(corpus, query)
+            pairs = self._bm25_rank(corpus, query, allowed)
         elif strategy == "vector":
-            pairs = self._vector_rank(corpus, query)
+            pairs = self._vector_rank(corpus, query, allowed=allowed)
         else:  # keyword
-            return self._keyword_actions(corpus, query, budget)
+            return self._keyword_actions(corpus, query, budget, allowed)
         return [self._action_result(corpus, i, s) for s, i in pairs[:budget]]
 
-    def _bm25_rank(self, corpus: JsonlCorpus, query: str) -> list[tuple[float, int]]:
-        """轻量 BM25 打分，返回 (score, doc_idx) 降序列表 (动作富字段用)。"""
+    def _bm25_rank(
+        self,
+        corpus: JsonlCorpus,
+        query: str,
+        allowed: Optional[set[int]] = None,
+    ) -> list[tuple[float, int]]:
+        """轻量 BM25 打分，返回 (score, doc_idx) 降序列表 (动作富字段用)。
+
+        ``allowed`` 限定参与打分的行号 (ACL 谓词下推，P4)。
+        """
         from .p1.search import tokenize
 
         q_tokens = set(tokenize(query))
@@ -588,6 +701,8 @@ class RetrievalService:
             if idf == 0:
                 continue
             for doc_idx, tf in corpus._postings.get(t, []):
+                if allowed is not None and doc_idx not in allowed:
+                    continue
                 dl = corpus._doc_len[doc_idx]
                 tf_norm = (
                     (tf * (1.5 + 1)) / (tf + 1.5 * (1 - 0.75 + 0.75 * (dl / corpus._avgdl)))
@@ -604,6 +719,7 @@ class RetrievalService:
         query: str,
         limit: Optional[int] = None,
         vector_filter: Optional[dict[str, Any]] = None,
+        allowed: Optional[set[int]] = None,
     ) -> list[tuple[float, int]]:
         """向量打分 (缺依赖时降级 BM25) 的 (score, doc_idx) 降序列表。
 
@@ -620,8 +736,11 @@ class RetrievalService:
 
         embed_fn = _optional_embedder()
         if embed_fn is None:
-            return self._bm25_rank(corpus, query)
+            return self._bm25_rank(corpus, query, allowed)
         top_k = limit if limit is not None else len(corpus.records)
+        if allowed is not None:
+            # 受限时多召回一些，抵消随后按行号过滤造成的损耗。
+            top_k = max(top_k, min(len(corpus.records), len(allowed) * 4))
         if top_k <= 0:
             return []
         try:
@@ -635,15 +754,27 @@ class RetrievalService:
             )
             if indexed and corpus.vector_dir is not None:
                 index.persist()
-            return index.search(query, top_k=top_k, filter=vector_filter)
+            hits = index.search(query, top_k=top_k, filter=vector_filter)
+            if allowed is not None:
+                hits = [(sc, i) for sc, i in hits if i in allowed]
+            return hits
         except Exception:
             logging.getLogger(__name__).warning(
                 "vector_score failed; falling back to BM25", exc_info=True
             )
-            return self._bm25_rank(corpus, query)
+            return self._bm25_rank(corpus, query, allowed)
 
-    def _keyword_actions(self, corpus: JsonlCorpus, query: str, top_k: int) -> list[dict]:
-        """动作专用 keyword 打分：对 action_id/title 加权。"""
+    def _keyword_actions(
+        self,
+        corpus: JsonlCorpus,
+        query: str,
+        top_k: int,
+        allowed: Optional[set[int]] = None,
+    ) -> list[dict]:
+        """动作专用 keyword 打分：对 action_id/title 加权。
+
+        ``allowed`` 限定参与打分的行号 (ACL 谓词下推，P4)。
+        """
         from .p1.search import tokenize
 
         q_tokens = set(tokenize(query))
@@ -653,6 +784,8 @@ class RetrievalService:
         # 需要访问每个记录的搜索文本。直接复用 JsonlCorpus 内部字段。
         scored: list[tuple[float, int]] = []
         for i, r in enumerate(corpus.records):
+            if allowed is not None and i not in allowed:
+                continue
             field = r["_searchable"]
             title = r.get("_title", "")
             action_id = r.get("action_id", "")
@@ -695,12 +828,13 @@ class RetrievalService:
         query: str,
         strategy: str,
         top_k: int,
+        allowed: Optional[set[int]] = None,
     ) -> list[dict]:
         if strategy == "bm25":
-            return corpus.bm25_search(query, limit=top_k)
+            return corpus.bm25_search(query, limit=top_k, allowed=allowed)
         if strategy == "vector":
-            return corpus.vector_search(query, limit=top_k)
-        return corpus.keyword_search(query, limit=top_k)
+            return corpus.vector_search(query, limit=top_k, allowed=allowed)
+        return corpus.keyword_search(query, limit=top_k, allowed=allowed)
 
     # ---------- 精确获取 ----------
 
@@ -762,6 +896,7 @@ class RetrievalService:
         *,
         adjacency: int = 1,
         include_section: bool = True,
+        acl: Optional[ACLPolicy] = None,
     ) -> Optional[dict]:
         """为命中节点组装「父子节点与相邻步骤上下文补全」(P1-4)。
 
@@ -781,6 +916,12 @@ class RetrievalService:
         nodes = self._load_nodes()
         if not nodes:
             return None
+        # P4: 越权节点不进上下文，且越权的 node_id 本身不得泄露内容。
+        allowed_ids = self._allowed_node_ids(acl)
+        if allowed_ids is not None:
+            if str(node_id) not in allowed_ids:
+                return None
+            nodes = self._scrub_node_refs(nodes, allowed_ids)
         from .p1.context import assemble_context
 
         snodes = _node_objects(nodes)
@@ -799,15 +940,26 @@ class RetrievalService:
         results: list[dict],
         *,
         adjacency: int = 1,
+        acl: Optional[ACLPolicy] = None,
     ) -> list[dict]:
         """给结构化节点检索结果附加 `context` 键（P1-4 上下文补全）。
 
         每个结果按 id 命中节点，调用 assemble_context（结构化 dict）并渲染
         出文本；节点加载失败或某条结果无法命中时，该条结果保持原样。
+
+        P4: **ACL 感知**。只把该策略允许可见的节点喂给 assemble_context ——
+        于是父节点、相邻兄弟、上下文窗口都只可能引用到已授权节点，不需要
+        事后再擦一遍。P3-3 的做法是对受限查询直接关掉补全（受限用户功能
+        降级），那既伤体验又没必要。
         """
         nodes = self._load_nodes()
         if not nodes:
             return results
+        allowed_ids = self._allowed_node_ids(acl)
+        if allowed_ids is not None:
+            nodes = self._scrub_node_refs(nodes, allowed_ids)
+            if not nodes:
+                return results
         from .p1.context import assemble_context, render_context_text
 
         snodes = _node_objects(nodes)
