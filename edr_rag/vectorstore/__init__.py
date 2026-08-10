@@ -1,11 +1,16 @@
-"""可插拔向量存储 (P3-1)。
+"""可插拔向量存储 (P3-1，P4 重写后端集合)。
 
 对外暴露的公共 API:
   - VectorStore / VectorRecord / VectorHit / VectorIndex: 抽象与通用工具
-  - SimpleVectorStore: 默认本地内存实现
-  - build_vector_store / get_vector_store: 配置化工厂
-  - 外部后端骨架: ElasticsearchVectorStore / OpenSearchVectorStore /
-    QdrantVectorStore / MilvusVectorStore / PGVectorStore
+  - PersistentVectorStore: 本地文件持久化 + 精确检索 (生产默认)
+  - SimpleVectorStore: 纯进程内实现 (测试 / 轻量调用方)
+  - build_vector_store / get_vector_store: 按 namespace 的配置化工厂
+
+P4 移除了 ElasticsearchVectorStore / OpenSearchVectorStore /
+QdrantVectorStore / MilvusVectorStore / PGVectorStore 五个
+``NotImplementedError`` 骨架 —— 详见 docs/requirements/P4-HARDENING-DESIGN.md
+§4 Lock 1。VectorStore 抽象接口保留，语料规模真的需要外部向量库时新增一个
+实现即可，检索层无需改动。
 """
 
 from __future__ import annotations
@@ -17,14 +22,14 @@ from .base import (
     VectorRecord,
     VectorStore,
 )
-from .backends import (
-    ElasticsearchVectorStore,
-    MilvusVectorStore,
-    OpenSearchVectorStore,
-    PGVectorStore,
-    QdrantVectorStore,
+from .factory import (
+    VECTOR_SUBDIR,
+    build_vector_store,
+    get_vector_store,
+    reset_shared_stores,
+    vector_dir_for_workdir,
 )
-from .factory import build_vector_store, get_vector_store
+from .persistent import PersistentVectorStore, validate_namespace
 from .simple import SimpleVectorStore
 
 __all__ = [
@@ -33,12 +38,12 @@ __all__ = [
     "VectorIndex",
     "VectorRecord",
     "VectorStore",
+    "PersistentVectorStore",
     "SimpleVectorStore",
-    "ElasticsearchVectorStore",
-    "OpenSearchVectorStore",
-    "QdrantVectorStore",
-    "MilvusVectorStore",
-    "PGVectorStore",
     "build_vector_store",
     "get_vector_store",
+    "reset_shared_stores",
+    "vector_dir_for_workdir",
+    "validate_namespace",
+    "VECTOR_SUBDIR",
 ]

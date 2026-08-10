@@ -587,29 +587,44 @@ class RetrievalService:
         ranked = sorted(scores.items(), key=lambda x: -x[1])
         return [(s, i) for i, s in ranked]
 
-    def _vector_rank(self, corpus: JsonlCorpus, query: str) -> list[tuple[float, int]]:
+    def _vector_rank(
+        self,
+        corpus: JsonlCorpus,
+        query: str,
+        limit: Optional[int] = None,
+        vector_filter: Optional[dict[str, Any]] = None,
+    ) -> list[tuple[float, int]]:
         """向量打分 (缺依赖时降级 BM25) 的 (score, doc_idx) 降序列表。
 
-        复用 p1.search 的可选 embedding 助手，保留对可选 RAG extras 的
-        支持；缺依赖时优雅降级到 BM25，主链路始终可用。
+        P4: 改为复用与 ``JsonlCorpus.vector_search`` 相同的持久化向量索引。
+        旧实现对**每条记录**调 ``_cached_vec`` 做 O(N) Python 循环余弦，且
+        与 corpus.vector_search 各建一套缓存；现在两条路径共享同一个
+        namespace 的向量存储，嵌入只做一次、落盘复用。
+
+        Args:
+            limit: 返回条数上限；None 表示取回整个语料的排序 (调用方自行截断)。
+            vector_filter: metadata 谓词，在打分前下推到存储层 (ACL)。
         """
-        from .p1.search import _cached_vec, _cosine, _optional_embedder
+        from .p1.search import _get_shared_index, _optional_embedder
 
         embed_fn = _optional_embedder()
         if embed_fn is None:
             return self._bm25_rank(corpus, query)
+        top_k = limit if limit is not None else len(corpus.records)
+        if top_k <= 0:
+            return []
         try:
-            q_vec = embed_fn(query)
-            scored: list[tuple[float, int]] = []
-            for i, r in enumerate(corpus.records):
-                vec = _cached_vec(embed_fn, r["_searchable"])
-                if vec is None:
-                    continue
-                score = _cosine(q_vec, vec)
-                if score > 0:
-                    scored.append((score, i))
-            scored.sort(key=lambda x: -x[0])
-            return scored
+            index = _get_shared_index(
+                embed_fn,
+                namespace=corpus.namespace or "default",
+                directory=corpus.vector_dir if corpus.namespace else None,
+            )
+            indexed = index.index_records(
+                corpus.records, text_field="_searchable", id_field="_doc_id"
+            )
+            if indexed and corpus.vector_dir is not None:
+                index.persist()
+            return index.search(query, top_k=top_k, filter=vector_filter)
         except Exception:
             logging.getLogger(__name__).warning(
                 "vector_score failed; falling back to BM25", exc_info=True

@@ -26,6 +26,10 @@ from typing import Any, Callable, Iterable, Optional
 #: 默认值常数，供各实现复用。
 DEFAULT_DIM = 512
 
+#: 需要提升到向量 metadata 顶层的 ACL 维度 (P4)。让权限谓词可以在存储层
+#: 下推，而不是「全语料召回后再过滤」。与 edr_rag.security._ACL_ATTRS 对齐。
+ACL_METADATA_FIELDS = ("device", "tenant")
+
 
 @dataclass
 class VectorRecord:
@@ -221,6 +225,13 @@ class VectorIndex:
             real_idx = doc_indices[i] if doc_indices is not None else i
             meta: dict[str, Any] = {"doc_idx": real_idx, "id": rec_id}
             meta.update(r.get("metadata") or {})
+            # ACL 维度提升为顶层 metadata，使权限谓词能在存储层下推 (P4)。
+            # 顶层字段优先于 metadata 内嵌值，与 security._record_acl_field
+            # 的读取顺序保持一致。
+            for attr in ACL_METADATA_FIELDS:
+                val = r.get(attr)
+                if val is not None:
+                    meta[attr] = val
             vector_records.append(
                 VectorRecord(
                     id=rec_id,
@@ -327,6 +338,25 @@ class VectorIndex:
 
     def count(self) -> int:
         return self.store.count()
+
+    def persist(self) -> bool:
+        """把底层存储落盘 (P4)。存储不支持持久化时返回 False，不抛异常。
+
+        由调用方在**实际发生写入之后**调用；``index_records`` 的内容签名短路
+        命中时不应调用，以免每次查询都产生无谓 IO。
+        """
+        save = getattr(self.store, "save", None)
+        if save is None:
+            return False
+        try:
+            return bool(save())
+        except Exception:  # pragma: no cover - best-effort 持久化
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "vector index persist failed", exc_info=True
+            )
+            return False
 
 
 def _all_ids(store: VectorStore) -> list[str]:
