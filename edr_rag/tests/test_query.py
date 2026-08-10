@@ -15,7 +15,13 @@ from pathlib import Path
 
 import pytest
 
-from edr_rag.query import SYNONYMS, expand_query, normalize_query
+from edr_rag.query import (
+    expand_query,
+    get_synonyms,
+    load_synonyms,
+    normalize_query,
+    reset_synonyms_cache,
+)
 from edr_rag.retrieval import RetrievalService
 from edr_rag.rerank import rrf_fuse
 
@@ -57,13 +63,37 @@ def test_normalize_empty():
 
 
 # ---------- expand_query ----------
+#
+# P4: 这些用例改用**测试自带的**词表，不再依赖 edr_rag/data/synonyms.zh.txt
+# 的具体内容。测试断言的是 expand_query 的机制（命中/替换/去重/截断），
+# 而不是某条业务词条 —— 词表是可被客户覆盖的数据，不该被测试锁死。
 
-def test_expand_returns_original_first():
+_TEST_VOCAB = """
+# 测试专用词表
+恢复出厂设置 => 重置系统
+恢复出厂 => 重置系统
+怎么查看 => 查看
+"""
+
+
+@pytest.fixture
+def test_synonyms(tmp_path, monkeypatch):
+    """把同义词表指向一份测试自带的小词表。"""
+    vocab = tmp_path / "syn.txt"
+    vocab.write_text(_TEST_VOCAB, encoding="utf-8")
+    monkeypatch.setenv("EDR_RAG_SYNONYMS", str(vocab))
+    reset_synonyms_cache()
+    yield vocab
+    monkeypatch.delenv("EDR_RAG_SYNONYMS", raising=False)
+    reset_synonyms_cache()
+
+
+def test_expand_returns_original_first(test_synonyms):
     vs = expand_query("配置代理")
     assert vs and vs[0] == "配置代理"
 
 
-def test_expand_generates_alias_variant():
+def test_expand_generates_alias_variant(test_synonyms):
     vs = expand_query("恢复出厂设置")
     # 首元素为原查询，命中别名替换出规范词变体。
     assert vs[0] == "恢复出厂设置"
@@ -71,25 +101,52 @@ def test_expand_generates_alias_variant():
     assert vs[0] != vs[1]
 
 
-def test_expand_normalizes_before_matching():
-    # 全角查询先规范化，再命中别名 (全角"恢复出厂设置"→半角规范词)。
+def test_expand_normalizes_before_matching(test_synonyms):
+    # 全角查询先规范化，再命中别名。
     vs = expand_query("恢复出厂设置")
     assert vs
 
 
-def test_expand_dedup_and_order_stable():
+def test_expand_dedup_and_order_stable(test_synonyms):
     vs1 = expand_query("恢复出厂设置")
     vs2 = expand_query("恢复出厂设置")
     assert vs1 == vs2
 
 
-def test_expand_max_variants():
+def test_expand_max_variants(test_synonyms):
     vs = expand_query("恢复出厂设置", max_variants=2)
     assert len(vs) <= 2
 
 
 def test_expand_empty():
     assert expand_query("") == []
+
+
+def test_longer_alias_wins(test_synonyms):
+    """更具体（更长）的别名优先，短别名不得抢先命中。"""
+    pairs = load_synonyms(test_synonyms)
+    lengths = [len(a) for a, _ in pairs]
+    assert lengths == sorted(lengths, reverse=True)
+
+
+def test_missing_vocab_degrades_to_normalize_only(tmp_path, monkeypatch):
+    """词表文件缺失时退化为「只规范化」，不抛异常。"""
+    monkeypatch.setenv("EDR_RAG_SYNONYMS", str(tmp_path / "nope.txt"))
+    reset_synonyms_cache()
+    try:
+        assert expand_query("恢复出厂设置") == ["恢复出厂设置"]
+    finally:
+        monkeypatch.delenv("EDR_RAG_SYNONYMS", raising=False)
+        reset_synonyms_cache()
+
+
+def test_shipped_vocab_loads():
+    """随包词表本身必须可解析（格式回归）。"""
+    reset_synonyms_cache()
+    pairs = get_synonyms()
+    assert pairs, "shipped synonym vocabulary should not be empty"
+    for alias, canonical in pairs:
+        assert alias and canonical and alias != canonical
 
 
 # ---------- retrieval 集成: 对称规范化 + 多查询开关 ----------
@@ -160,7 +217,7 @@ def test_full_width_query_hits_half_width_corpus(service):
     assert any(r["id"] == "s1" for r in raw_res), "query_expansion=False 仍应规范化"
 
 
-def test_query_expansion_recalls_alias(service):
+def test_query_expansion_recalls_alias(service, test_synonyms):
     # "恢复出厂" 别名展开到 "重置系统", 应能召回 reset 动作。
     res = service.search("如何恢复出厂设置", corpus_type="actions", strategy="keyword")
     ids = [r["id"] for r in res]

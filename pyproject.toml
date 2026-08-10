@@ -49,8 +49,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["edr_rag"]
-# 随包携带评测集数据 (JSONL)，保证安装后 edr-rag-eval 可直接使用。
-force-include = { "edr_rag/eval/data" = "edr_rag/eval/data" }
+# 随包携带评测集数据 (JSONL) 与查询扩展词表 (P4)，保证安装后
+# edr-rag-eval 与 expand_query 都能直接使用。
+force-include = { "edr_rag/eval/data" = "edr_rag/eval/data", "edr_rag/data" = "edr_rag/data" }
 
 [tool.pytest.ini_options]
 testpaths = ["edr_rag"]

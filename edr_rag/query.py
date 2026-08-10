@@ -22,8 +22,11 @@
 
 from __future__ import annotations
 
+import os
 import re
 import unicodedata
+from pathlib import Path
+from typing import Optional
 
 # ---------- 规范化 ----------
 
@@ -64,28 +67,72 @@ def normalize_query(text: str) -> str:
 
 # ---------- 同义/别名表（多查询生成的变体来源） ----------
 
-#: 有序 (别名, 规范词) 表。expand_query 对每条查询，把命中的首个别名替换为
-#: 规范词生成一个变体。规则按「更具体在前」排序，避免短别名过早截断。
-#: 这些短语取自评测集（eval/data/eval_set_default.jsonl）的同义改写与常见
-#: EDR 口语表述，覆盖「重置系统 / 配置代理 / 查看安全状态」等高频场景。
-SYNONYMS: list[tuple[str, str]] = [
-    ("恢复出厂设置", "重置系统"),
-    ("恢复出厂", "重置系统"),
-    ("系统初始化", "重置系统"),
-    ("系统重置", "重置系统"),
-    ("重置计算机", "重置系统"),
-    ("重新安装系统", "重置系统"),
-    ("设置代理", "配置代理"),
-    ("代理怎么设置", "配置代理"),
-    ("配置网络代理", "配置代理"),
-    ("代理服务器配置", "配置代理"),
-    ("查看防护状态", "查看安全状态"),
-    ("安全状态怎么看", "查看安全状态"),
-    ("安全状态在哪看", "查看安全状态"),
-    ("防护状态", "安全状态"),
-    ("查询安全状态", "查看安全状态"),
-    ("怎么查看", "查看"),
-]
+#: 词表文件路径。可用 EDR_RAG_SYNONYMS 覆盖（客户现场维护自己产品的术语）。
+_DEFAULT_SYNONYMS_FILE = Path(__file__).parent / "data" / "synonyms.zh.txt"
+
+
+def _synonyms_path() -> Path:
+    override = os.environ.get("EDR_RAG_SYNONYMS", "").strip()
+    return Path(override) if override else _DEFAULT_SYNONYMS_FILE
+
+
+def load_synonyms(path: Optional[Path] = None) -> list[tuple[str, str]]:
+    """从词表文件加载 (别名, 规范词) 列表。
+
+    格式：每行 ``别名 => 规范词``；``#`` 起始为注释，空行忽略。
+    文件缺失或不可读时返回空表（查询扩展退化为「只做规范化」，主链路不受影响）。
+
+    返回列表按**别名长度降序**排序 —— 更具体（更长）的别名优先匹配，避免
+    短别名把长别名的机会吃掉（例如「查看」不应抢在「怎么查看」之前命中）。
+    """
+    p = path or _synonyms_path()
+    try:
+        text = p.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
+    pairs: list[tuple[str, str]] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=>" not in line:
+            continue
+        alias, _, canonical = line.partition("=>")
+        alias, canonical = alias.strip(), canonical.strip()
+        if alias and canonical and alias != canonical:
+            pairs.append((alias, canonical))
+    pairs.sort(key=lambda kv: -len(kv[0]))
+    return pairs
+
+
+#: 进程内缓存的同义表（惰性加载）。
+_SYNONYMS_CACHE: Optional[list[tuple[str, str]]] = None
+
+
+def get_synonyms() -> list[tuple[str, str]]:
+    """返回同义表（进程内缓存）。"""
+    global _SYNONYMS_CACHE
+    if _SYNONYMS_CACHE is None:
+        _SYNONYMS_CACHE = load_synonyms()
+    return _SYNONYMS_CACHE
+
+
+def reset_synonyms_cache() -> None:
+    """清空同义表缓存（测试 / 热更新词表后调用）。"""
+    global _SYNONYMS_CACHE
+    _SYNONYMS_CACHE = None
+
+
+def _legacy_synonyms() -> list[tuple[str, str]]:
+    """向后兼容：模块级 SYNONYMS 名称保留，但改为读词表文件。
+
+    P1-6 的实现把 16 条别名硬编码在这里，而这 16 条**逐条对应**评测集
+    (eval/data/eval_set_default.jsonl) 里 3 个 action 的 paraphrases，
+    再用同一份评测集去调 RRF 权重 —— 指标只是在验证「我们把答案抄进了
+    代码」。P4 把词表外置到 data/synonyms.zh.txt，并加结构性测试禁止
+    从评测集反抄（见 tests/test_query_expansion.py）。
+    """
+    return get_synonyms()
 
 
 def expand_query(text: str, max_variants: int = 5) -> list[str]:
@@ -106,7 +153,7 @@ def expand_query(text: str, max_variants: int = 5) -> list[str]:
     if not base:
         return []
     variants = [base]
-    for alias, canonical in SYNONYMS:
+    for alias, canonical in get_synonyms():
         if len(variants) >= max_variants:
             break
         if alias in base:

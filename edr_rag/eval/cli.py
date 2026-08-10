@@ -86,22 +86,41 @@ def _cli_validate(args: argparse.Namespace):
 
 
 def _cli_tune(args: argparse.Namespace):
-    """(P1-6) 网格搜索 hybrid 的 RRF 融合权重。"""
+    """(P1-6，P4 加 holdout) 网格搜索 hybrid 的 RRF 融合权重。"""
     evalset = _load(args)
     from .tune import tune_rrf_weights
 
-    result = tune_rrf_weights(args.workdir, evalset, metric=args.metric)
+    result = tune_rrf_weights(
+        args.workdir, evalset, metric=args.metric,
+        holdout_ratio=args.holdout_ratio,
+    )
     if result.candidates_tried == 0:
         print("评测集为空，跳过权重调节 (返回默认等权)。")
         return
     print(f"目标指标: {result.metric}")
-    print(f"候选网格: {result.candidates_tried} 个配置")
-    for cfg, score in sorted(
-        result.scores.items(), key=lambda kv: -kv[1]
-    ):
+    print(f"切分:     train {result.train_size} 条 / holdout {result.holdout_size} 条")
+    print(f"候选网格: {result.candidates_tried} 个配置 (在 train 上选)")
+    for cfg, score in sorted(result.scores.items(), key=lambda kv: -kv[1]):
         print(f"    {cfg:<22} {score:.4f}")
-    print(f"最优权重: {result.best_weights}  (fusion [keyword, bm25, (vector)])")
-    print(f"最优 {result.metric}: {result.best_score:.4f}")
+    print()
+    print(f"最优权重:        {result.best_weights}  (fusion [keyword, bm25, (vector)])")
+    print(f"train {result.metric}:  {result.best_score:.4f}   <- 乐观，不要对外汇报这个数")
+    print(f"holdout {result.metric}:{result.holdout_score:.4f}   <- 可汇报")
+    print(f"等权基线:        {result.baseline_holdout_score:.4f}")
+    print(f"过拟合间隙:      {result.overfit_gap:+.4f}  (train - holdout)")
+    print(f"调参净收益:      {result.tuning_gain:+.4f}  (holdout - 等权基线)")
+
+    if not result.split_applied:
+        print()
+        print("⚠  评测集过小或未切分：holdout 与 train 同源，以上分数全部不可信。")
+        print("   请把评测集扩充到至少 20 条真实查询后重跑。")
+    elif result.tuning_gain <= 0:
+        print()
+        print("⚠  调参在 holdout 上没有跑赢等权基线 —— 建议直接用等权 (None)。")
+    elif result.overfit_gap > 0.15:
+        print()
+        print("⚠  train 明显高于 holdout，网格搜索在过拟合调参集。")
+        print("   增大评测集规模，或缩小候选网格。")
 
 
 def main():
@@ -134,6 +153,10 @@ def main():
     p_tune = sub.add_parser("tune", help="(P1-6) 网格搜索 RRF 融合权重")
     p_tune.add_argument("--workdir", required=True)
     p_tune.add_argument("--data", required=True)
+    p_tune.add_argument(
+        "--holdout-ratio", dest="holdout_ratio", type=float, default=0.3,
+        help="留出集比例 (P4)；0 表示不切分 (分数将不可信)",
+    )
     p_tune.add_argument("--metric", default="recall@k",
                         choices=["recall@k", "mrr", "ndcg@k", "filter_accuracy"])
     p_tune.set_defaults(func=_cli_tune)
