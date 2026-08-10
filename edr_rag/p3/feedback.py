@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 
@@ -71,6 +72,8 @@ class FeedbackItem:
     status: str = "captured"
     created_at: str = ""
     closed_at: Optional[str] = None
+    #: P4: 审核备注（驳回原因等），供人工复核留痕。
+    review_note: str = ""
 
     def to_jsonl(self) -> dict:
         d = asdict(self)
@@ -99,7 +102,19 @@ FAILURE_TYPES = {
 }
 
 # Status lifecycle
-FEEDBACK_STATUSES = ["captured", "needs_review", "patch_proposed", "patched", "reindexed", "closed"]
+#: P4: 增补 patch_approved / patch_rejected —— 补丁必须经人工审核才能应用，
+#: 审核状态机需要一条明确的「驳回」出边，否则被否掉的提议会一直挂在
+#: patch_proposed 上，跟「还没审」分不开。
+FEEDBACK_STATUSES = [
+    "captured",
+    "needs_review",
+    "patch_proposed",
+    "patch_approved",
+    "patch_rejected",
+    "patched",
+    "reindexed",
+    "closed",
+]
 
 
 # ---------- Feedback store ----------
@@ -136,20 +151,42 @@ class FeedbackStore:
     def update_status(self, feedback_id: str, status: str) -> bool:
         """Update the status of a feedback item in place.
 
-        Rewrites the entire file — acceptable for P3 scale.
         Returns True if found and updated.
+        """
+        return self.update_item(feedback_id, status=status)
+
+    def update_item(self, feedback_id: str, **changes) -> bool:
+        """就地更新一条反馈的任意字段，**单次原子重写** (P4)。
+
+        P3 的 ``classify_failure`` 要改两个字段，于是先调 update_status 重写
+        一遍文件、再自己读回来重写第二遍 —— 两次非原子写，中间崩溃会留下
+        状态改了但 failure_type 没改的半截记录。这里一次写完。
+
+        Args:
+            **changes: 要更新的字段（status / failure_type / suggested_patch /
+                review_note 等）。未知字段会被忽略。
+
+        Returns:
+            True 表示找到并更新；False 表示没有该 id。
         """
         items = self.read_all()
         found = False
         for item in items:
-            if item.feedback_id == feedback_id:
-                item.status = status
-                if status == "patched" or status == "closed":
-                    item.closed_at = datetime.now(timezone.utc).isoformat()
-                found = True
-                break
+            if item.feedback_id != feedback_id:
+                continue
+            for key, value in changes.items():
+                if hasattr(item, key):
+                    setattr(item, key, value)
+            status = changes.get("status")
+            if status in ("patched", "closed"):
+                item.closed_at = datetime.now(timezone.utc).isoformat()
+            found = True
+            break
         if found:
-            with open(self.path, "w", encoding="utf-8") as f:
-                for item in items:
-                    f.write(json.dumps(item.to_jsonl(), ensure_ascii=False) + "\n")
+            from ..atomic_io import atomic_write_text
+
+            payload = "".join(
+                json.dumps(i.to_jsonl(), ensure_ascii=False) + "\n" for i in items
+            )
+            atomic_write_text(Path(self.path), payload)
         return found

@@ -244,61 +244,108 @@ class EdrRagAgent:
         self.feedback_store.append(item)
         return feedback_id
 
-    def classify_failure(self, feedback_id: str) -> bool:
-        """Classify a failure type from evidence for a feedback item. Placeholder.
+    def _find_feedback(self, feedback_id: str):
+        """按 id 取一条反馈；不存在返回 None。"""
+        for item in self.feedback_store.read_all():
+            if item.feedback_id == feedback_id:
+                return item
+        return None
 
-        In P3 this uses heuristics (no LLM). Returns True if reclassified.
+    def classify_failure(self, feedback_id: str) -> dict:
+        """按规则表分类失败类型 (P4 Phase H)。
+
+        P3 版本是 4 条 if-elif 子串匹配，覆盖 FAILURE_TYPES 里 11 种中的 4 种，
+        且 ``"ui" in msg`` 会把任何含 build/guide/require 的消息误判成 UI 错误
+        （子串匹配没有词边界）。现在走 ``classify`` 的带优先级规则表，
+        expected / observed / error_message / dump_tree 都参与判定。
+
+        Returns:
+            dict: {ok, feedback_id, failure_type, matched, rationale}。
+                未命中任何规则时保留原有 failure_type（可能是 edr-wd 已判好的），
+                而不是硬塞一个错的。
         """
-        items = self.feedback_store.read_all()
-        target = None
-        for item in items:
-            if item.feedback_id == feedback_id:
-                target = item
-                break
-        if not target:
-            return False
+        from edr_rag.p3.classify import classify
 
-        # Heuristic: if evidence has error_message, try to classify
-        if target.evidence and target.evidence.error_message:
-            msg = target.evidence.error_message.lower()
-            if "not found" in msg and "button" in msg:
-                target.failure_type = "button_text_not_found"
-            elif "timeout" in msg:
-                target.failure_type = "timeout"
-            elif "network" in msg or "connection" in msg:
-                target.failure_type = "network_error"
-            elif "ui" in msg or "element" in msg:
-                target.failure_type = "missing_ui_label"
+        target = self._find_feedback(feedback_id)
+        if target is None:
+            return {"ok": False, "feedback_id": feedback_id, "error": "not found"}
 
-        target.status = "needs_review"
-        self.feedback_store.update_status(feedback_id, target.status)
-        # Update failure_type in file by rewriting
-        items = self.feedback_store.read_all()
-        for item in items:
-            if item.feedback_id == feedback_id:
-                item.failure_type = target.failure_type
-                break
-        with open(self.feedback_store.path, "w", encoding="utf-8") as f:
-            for item in items:
-                f.write(json.dumps(item.to_jsonl(), ensure_ascii=False) + "\n")
-        return True
+        result = classify(target)
+        self.feedback_store.update_item(
+            feedback_id,
+            failure_type=result.failure_type or target.failure_type,
+            status="needs_review",
+        )
+        payload = {"ok": True, "feedback_id": feedback_id}
+        payload.update(result.to_dict())
+        return payload
 
     def propose_patch(self, feedback_id: str) -> Optional[dict]:
-        """Propose a patch from a feedback item. Placeholder.
+        """由反馈**生成**一个动作目录补丁 (P4 Phase H)。
 
-        Returns the suggested patch dict, or None if no patch to propose.
+        P3 版本只是把调用方自己传进来的 patch 原样退回并改个状态——既不生成
+        也不应用，反馈回路在这里就断了。现在按 failure_type + evidence 推导
+        补丁；调用方已显式给出 patch 时以它为准（人比启发式可靠）。
+
+        生成的补丁**不会自动应用**，需要显式调用 ``apply_patch``。
         """
-        items = self.feedback_store.read_all()
-        target = None
-        for item in items:
-            if item.feedback_id == feedback_id:
-                target = item
-                break
-        if not target or not target.suggested_patch:
-            return None
+        from edr_rag.p3.patch import propose
 
-        self.feedback_store.update_status(feedback_id, "patch_proposed")
-        return target.suggested_patch.to_jsonl()
+        target = self._find_feedback(feedback_id)
+        if target is None:
+            return None
+        patch = propose(target)
+        if patch is None:
+            return None
+        self.feedback_store.update_item(
+            feedback_id, suggested_patch=patch, status="patch_proposed"
+        )
+        return patch.to_jsonl()
+
+    def apply_patch(self, feedback_id: str, confirm: bool = False) -> dict:
+        """把已提议的补丁真正写进 actions.jsonl (P4 Phase H)。
+
+        动作目录直接驱动客户终端上的 GUI 自动化——一条错补丁 = 在客户机器上
+        点错按钮。因此：
+          - 只应用 status 已是 patch_proposed 的条目（必须先走提议）
+          - 高风险动作需要 confirm=True
+          - 应用前捕获索引版本快照，可用 `edr-rag index rollback` 回退
+
+        Returns:
+            PatchResult.to_dict()，附带 feedback_id。
+        """
+        from edr_rag.p3.patch import PATCH_APPLIED, PATCH_PROPOSED, apply
+
+        target = self._find_feedback(feedback_id)
+        if target is None:
+            return {"ok": False, "feedback_id": feedback_id, "error": "not found"}
+        if target.status != PATCH_PROPOSED:
+            return {
+                "ok": False,
+                "feedback_id": feedback_id,
+                "error": (
+                    f"feedback status is '{target.status}'; "
+                    f"call propose_patch first (expected '{PATCH_PROPOSED}')"
+                ),
+            }
+
+        result = apply(self.workdir, target, confirm=confirm)
+        payload = result.to_dict()
+        payload["feedback_id"] = feedback_id
+        if result.ok:
+            self.feedback_store.update_item(feedback_id, status=PATCH_APPLIED)
+        return payload
+
+    def reject_patch(self, feedback_id: str, reason: str = "") -> dict:
+        """驳回一个补丁提议 (P4 Phase H) —— 审核状态机的另一条出边。"""
+        from edr_rag.p3.patch import PATCH_REJECTED
+
+        if self._find_feedback(feedback_id) is None:
+            return {"ok": False, "feedback_id": feedback_id, "error": "not found"}
+        self.feedback_store.update_item(
+            feedback_id, status=PATCH_REJECTED, review_note=reason
+        )
+        return {"ok": True, "feedback_id": feedback_id, "status": PATCH_REJECTED}
 
     # ----- Re-index -----
 
@@ -535,6 +582,39 @@ def create_mcp_server(workdir: str) -> Server:
                 },
             ),
             types.Tool(
+                name="apply_patch",
+                description=("P4: 把已提议的补丁真正写入动作目录 (actions.jsonl)。"
+                             "必须先调用 propose_patch。动作目录直接驱动客户终端上的 GUI "
+                             "自动化——一条错误的补丁会导致在客户机器上点错按钮，因此高风险 "
+                             "Action 的补丁需要 confirm=true。应用前会捕获索引版本快照，"
+                             "可用 CLI `edr-rag index rollback` 回退。"),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "feedback_id": {"type": "string", "description": "已提议补丁的反馈 id"},
+                        "confirm": {
+                            "type": "boolean",
+                            "description": ("高风险 Action 的目录改动需显式确认。默认 false；"
+                                            "未确认时返回 requires_confirmation=true 的门控结果。"),
+                            "default": False,
+                        },
+                    },
+                    "required": ["feedback_id"],
+                },
+            ),
+            types.Tool(
+                name="reject_patch",
+                description="P4: 驳回一个补丁提议，并记录驳回原因（审核留痕）。",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "feedback_id": {"type": "string", "description": "待驳回的反馈 id"},
+                        "reason": {"type": "string", "description": "驳回原因"},
+                    },
+                    "required": ["feedback_id"],
+                },
+            ),
+            types.Tool(
                 name="reindex",
                 description="Trigger re-index from P0 artifacts. Requires .chm files in workdir/input/.",
                 inputSchema={
@@ -580,11 +660,23 @@ def create_mcp_server(workdir: str) -> Server:
                 fb_id = agent.capture_feedback(arguments)
                 results = {"feedback_id": fb_id, "status": "captured"}
             elif name == "classify_failure":
-                ok = agent.classify_failure(arguments["feedback_id"])
-                results = {"ok": ok, "feedback_id": arguments["feedback_id"]}
+                # P4: 返回带分类依据的结构化结果，而不只是一个 bool。
+                results = agent.classify_failure(arguments["feedback_id"])
             elif name == "propose_patch":
                 patch = agent.propose_patch(arguments["feedback_id"])
-                results = {"ok": patch is not None, "patch": patch} if patch else {"ok": False, "error": "no patch to propose"}
+                results = (
+                    {"ok": True, "patch": patch}
+                    if patch
+                    else {"ok": False, "error": "no patch could be derived from this feedback"}
+                )
+            elif name == "apply_patch":
+                results = agent.apply_patch(
+                    arguments["feedback_id"], confirm=arguments.get("confirm", False)
+                )
+            elif name == "reject_patch":
+                results = agent.reject_patch(
+                    arguments["feedback_id"], reason=arguments.get("reason", "")
+                )
             elif name == "reindex":
                 results = agent.reindex(arguments["manual_id"], arguments["product"])
             else:
