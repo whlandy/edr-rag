@@ -221,10 +221,61 @@ metadata 谓词下推），删除 `backends.py` 中 ES / OpenSearch / Qdrant / M
 
 ---
 
-## 8. Review Stop Point
+## 8. 实施记录（R1）
 
-**Status: R0 — 待 edr-test 评审。**
+八个 Phase 均已落地，每个一个原子 commit。
 
-按 review protocol，本文档需要 `APPROVED` 或 `APPROVED WITH MINOR LOCKS` 后方可进入实现阶段。
-用户已明确指示「写计划然后把阻塞和严重问题都改好」，因此实现将紧随本文档推进；
-每个 Phase 仍按 A/B/C 拍板选项单独提交报告，评审边界不丢失。
+| Phase | Commit | 测试 | 说明 |
+|---|---|---|---|
+| A 检索内核 | `ec76b83` | 454 (+15) | embedder 单例、向量持久化、namespace 隔离 |
+| B 中文分词 | `262efaf` | 467 (+13) | unigram + bigram，jieba 可选 |
+| C 评测可信度 | `d3529fc` | 485 (+18) | 词表外置、holdout 切分 |
+| D 生成侧 | `4e43247` | 516 (+31) | LLM 抽象 + 自托管 OpenAI 兼容端点 |
+| E 答案质量 | `7b3f189` | 552 (+30) | 置信度挂钩检索、rerank 修复、冲突扩展 |
+| F 安全与权限 | `9175a10` | 573 (+21) | ACL 谓词下推、注入清洗全路径 |
+| G 服务化运维 | `1e82dfa` | 611 (+38) | HTTP API、鉴权限流、CI、轮转 |
+| H 反馈闭环 | `bc89c34` | 648 (+37) | 分类规则化、补丁生成与应用 |
+
+### 验收结果
+
+| # | 标准 | 结果 |
+|---|---|---|
+| AC-1 | 第二次 embedding < 100ms | ✅ 26.0ms（旧 ~10000ms） |
+| AC-2 | 重启不重新嵌入 | ✅ |
+| AC-3 | 三层语料 namespace 不互相清空 | ✅ |
+| AC-4 | 无 `NotImplementedError` 后端 | ✅ `backends.py` 已删除 |
+| AC-5 | `tokenize` 可区分同字异序 | ✅ |
+| AC-6 | 词表无评测集反抄 | ✅ 0 条泄漏 |
+| AC-7 | train/holdout 不重叠 | ✅ 23 / 17 |
+| AC-8 | LLM 端点不可达时降级不抛异常 | ✅ |
+| AC-9 | ACL 受限不对全语料打分 | ✅ 3 条 / 语料 50 条 |
+| AC-10 | 组装路径同样注入清洗 | ✅ |
+| AC-11 | 无 key 401、超配额 429 | ✅ `service/test_service.py` |
+| AC-12 | 全量测试通过，OCR 缺引擎时 skip | ✅ 648 passed / 0 failed |
+| AC-13 | 干净环境（无可选依赖）可通过 | ✅ 649 passed，2.94s |
+
+### 实施中偏离设计的决定
+
+| 项 | 初稿 | 实际 | 理由 |
+|---|---|---|---|
+| ANN | 「可选 hnswlib」 | 精确检索，不引入 hnswlib | 目标语料规模下 ANN 无收益；一个半成品可选分支就是本文档正在删除的那五个空壳的翻版；精确检索还保证零召回损失 |
+
+### 实施中发现的、评估时未列出的问题
+
+| 发现 | 处理 |
+|---|---|
+| 上下文补全按 ACL 过滤节点后，被授权父节点的 `children` 数组仍引用越权子节点 id —— 内容没泄露但暴露了受限文档的存在性与数量 | 新增 `_scrub_node_refs` 清掉所有跨界悬空引用 |
+| 文档向量缓存是无界 dict（长跑进程内存泄漏） | 改为有界 LRU |
+| `classify_failure` 分两次非原子重写反馈文件，中途崩溃留半截记录 | 新增 `update_item` 单次原子写 |
+| `HTTPServer.server_bind` 的 `getfqdn()` 反查在离线网络上要等 DNS 超时（实测卡 35 秒）——而离线正是目标部署环境 | 服务与测试均覆盖 `server_bind` |
+
+## 9. Review Stop Point
+
+**Status: R1 — 实现已完成，待 edr-test 评审。**
+
+按 review protocol，八个 Phase 各自是独立的原子 commit，可逐个 A/B/C 拍板；
+驳回任一 Phase 不影响其它 Phase 的评审边界。
+
+**尚未解决（需要代码之外的输入）**：评测集仍只有 30 条、覆盖 3 个 action。
+这需要真实 CHM 语料与领域专家标注（见 §2.2）。holdout 切分让过拟合变得可见，
+但不能替代真实数据。**上线前必须补这一项** —— 在此之前所有检索指标都没有预测力。
