@@ -872,6 +872,42 @@ class RetrievalService:
                 return {k: v for k, v in r.items() if not k.startswith("_")}
         return None
 
+    def list_actions(
+        self,
+        product: Optional[str] = None,
+        module: Optional[str] = None,
+        status: Optional[str] = None,
+        acl: Optional[ACLPolicy] = None,
+    ) -> list[dict]:
+        """按条件枚举 action catalog（不做关键词匹配，design §3.3）。
+
+        与 search 的区别：search 按相关性排序取 top-k，会漏掉低分条目；
+        这里是无查询的全量枚举 + 过滤，供 agent 先看「目录里有什么」。
+
+        Args:
+            product: 按产品过滤；None 不过滤。
+            module: 按模块过滤；None 不过滤。
+            status: 按生命周期状态过滤 (candidate/needs_review/approved/
+                published/deprecated)；None 不过滤。
+            acl: ACL 策略；受限调用方只能枚举到有权见的记录。
+        """
+        corpus = self._corpus("actions")
+        if corpus is None:
+            return []
+        allowed = self._acl_allowed_rows("actions", acl)
+        out: list[dict] = []
+        for i, r in enumerate(corpus.records):
+            if allowed is not None and i not in allowed:
+                continue
+            if product is not None and r.get("product", "") != product:
+                continue
+            if module is not None and r.get("module", "") != module:
+                continue
+            if status is not None and r.get("status", "") != status:
+                continue
+            out.append({k: v for k, v in r.items() if not k.startswith("_")})
+        return out
+
     # ---------- P1-4: 父子节点与相邻步骤上下文补全 ----------
 
     def _load_nodes(self) -> list[dict]:

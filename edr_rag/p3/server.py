@@ -169,6 +169,15 @@ class EdrRagAgent:
         """Retrieve a specific action by action_id."""
         return self.retrieval.get("actions", action_id, key_field="action_id")
 
+    def list_actions(self, product: Optional[str] = None, module: Optional[str] = None,
+                     status: Optional[str] = None) -> list[dict]:
+        """Enumerate action catalog entries by filter (design §3.3 list_actions).
+
+        与 search_actions 的区别：无查询词、无相关性排序，全量枚举后按
+        product/module/status 过滤，不会因相关性得分低而漏掉条目。
+        """
+        return self.retrieval.list_actions(product=product, module=module, status=status)
+
     def get_procedure(self, procedure_id: str) -> Optional[dict]:
         """Retrieve a specific procedure by id."""
         return self.retrieval.get("procedures", procedure_id, key_field="id")
@@ -482,6 +491,22 @@ def create_mcp_server(workdir: str) -> Server:
                 },
             ),
             types.Tool(
+                name="list_actions",
+                description="Enumerate action catalog entries by product/module/status filter. Use to see what the catalog contains before searching; no relevance ranking, so nothing is missed.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "product": {"type": "string", "description": "Filter by product name; omit for all"},
+                        "module": {"type": "string", "description": "Filter by module; omit for all"},
+                        "status": {
+                            "type": "string",
+                            "description": "Filter by lifecycle status; omit for all",
+                            "enum": ["candidate", "needs_review", "approved", "published", "deprecated"],
+                        },
+                    },
+                },
+            ),
+            types.Tool(
                 name="get_procedure",
                 description="Retrieve a full procedure by procedure id.",
                 inputSchema={
@@ -641,6 +666,12 @@ def create_mcp_server(workdir: str) -> Server:
             elif name == "get_action":
                 result = agent.get_action(arguments["action_id"])
                 results = result if result else {"error": "not found"}
+            elif name == "list_actions":
+                results = agent.list_actions(
+                    product=arguments.get("product"),
+                    module=arguments.get("module"),
+                    status=arguments.get("status"),
+                )
             elif name == "get_procedure":
                 result = agent.get_procedure(arguments["procedure_id"])
                 results = result if result else {"error": "not found"}

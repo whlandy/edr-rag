@@ -94,6 +94,59 @@ def test_search_invalid_strategy_raises(agent: EdrRagAgent):
         agent.search_actions("配置代理", strategy="fuzzy")
 
 
+# ----- list_actions (design §3.3): filter enumeration, no relevance ranking -----
+
+def test_list_actions_returns_all_without_filter(agent: EdrRagAgent):
+    results = agent.list_actions()
+    assert isinstance(results, list)
+    assert "network.configure_proxy" in [r["action_id"] for r in results]
+    assert "system.reset_system" in [r["action_id"] for r in results]
+    # Records must not leak internal retrieval fields (same contract as get).
+    for r in results:
+        assert not any(k.startswith("_") for k in r)
+
+
+def test_list_actions_filters_by_module_and_status(agent: EdrRagAgent):
+    by_module = agent.list_actions(module="network")
+    assert [r["action_id"] for r in by_module] == ["network.configure_proxy"]
+
+    by_status = agent.list_actions(status="needs_review")
+    assert [r["action_id"] for r in by_status] == ["system.reset_system"]
+
+    by_product = agent.list_actions(product="EDR")
+    assert len(by_product) == 2
+
+    # No match -> empty list, not an error.
+    assert agent.list_actions(status="published") == []
+
+
+def test_mcp_server_lists_list_actions_tool():
+    app = create_mcp_server(".")
+    res = _run(app.request_handlers[ListToolsRequest](ListToolsRequest()))
+    tools = {t.name: t for t in res.root.tools}
+    assert "list_actions" in tools
+    props = tools["list_actions"].inputSchema["properties"]
+    assert props["status"]["enum"] == [
+        "candidate", "needs_review", "approved", "published", "deprecated",
+    ]
+
+
+def test_mcp_server_list_actions_dispatch(agent: EdrRagAgent):
+    app = create_mcp_server(str(agent.workdir))
+    handler = app.request_handlers[CallToolRequest]
+
+    req = CallToolRequest(params={"name": "list_actions", "arguments": {"module": "system"}})
+    res = _run(handler(req))
+    parsed = json.loads([c.text for c in res.root.content][0])
+    assert [r["action_id"] for r in parsed] == ["system.reset_system"]
+
+    # Empty arguments -> unfiltered enumeration.
+    req = CallToolRequest(params={"name": "list_actions", "arguments": {}})
+    res = _run(handler(req))
+    parsed = json.loads([c.text for c in res.root.content][0])
+    assert len(parsed) == 2
+
+
 # ----- MCP search flow returns JSON-text results (agent-level ser round-trip) -----
 
 def test_mcp_search_flow_returns_serializable_results(agent: EdrRagAgent):
