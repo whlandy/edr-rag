@@ -138,7 +138,11 @@ def parse_html_file(html_path: Path, extracted_dir: Path) -> ParsedPage:
     if BeautifulSoup is None:
         raise RuntimeError("BeautifulSoup (bs4) is required for HTML parsing")
 
-    text = html_path.read_text(encoding="utf-8", errors="replace")
+    from .charset import read_text_charset_aware
+
+    # CHM 内 HTML 常见 GB2312/GBK，且 meta 声明可能缺失/不符——硬编码
+    # utf-8 会把中文 content 读成乱码（见 charset.py 模块说明）。
+    text = read_text_charset_aware(html_path)
 
     soup = BeautifulSoup(text, "html.parser")
 

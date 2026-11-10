@@ -42,7 +42,11 @@ def parse_hhc(hhc_path: Path) -> list[TocEntry]:
     if BeautifulSoup is None:
         raise RuntimeError("BeautifulSoup (bs4) is required for TOC parsing")
 
-    text = hhc_path.read_text(encoding="utf-8", errors="replace")
+    from .charset import read_text_charset_aware
+
+    # .hhc 与 CHM 内 HTML 同源同编码，常为 GB2312/GBK——硬编码 utf-8 会把
+    # section_path 中文名读成乱码（见 charset.py 模块说明）。
+    text = read_text_charset_aware(hhc_path)
     soup = BeautifulSoup(text, "html.parser")
 
     entries: list[TocEntry] = []
