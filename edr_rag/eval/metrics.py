@@ -73,6 +73,7 @@ def ndcg_at_k(ranked_ids: Sequence[str], relevant: Iterable[str], k: int) -> flo
 
     ranked_ids 中重复的 id 只按首次出现计分一次：检索层可能对同一 id
     返回多条候选（语料存在重复 id），重复计入会让 DCG 超过 IDCG 上限。
+    重复结果仍占据原始排名，以零相关度计入，不将后续结果提前。
     """
     relevant = set(relevant)
     if not relevant:
@@ -81,6 +82,7 @@ def ndcg_at_k(ranked_ids: Sequence[str], relevant: Iterable[str], k: int) -> flo
     rel: list[float] = []
     for rid in ranked_ids[:k]:
         if rid in seen:
+            rel.append(0.0)
             continue
         seen.add(rid)
         rel.append(1.0 if rid in relevant else 0.0)

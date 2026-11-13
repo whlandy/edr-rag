@@ -127,7 +127,8 @@ def test_ndcg_empty_relevant_degenerate_one():
 def test_ndcg_duplicate_relevant_counted_once():
     # 同一相关 id 重复出现只计首现一次：修复前 DCG 重复计分导致 nDCG=1.307>1
     val = ndcg_at_k(["a", "a", "b"], {"a", "b"}, k=3)
-    assert val == pytest.approx(1.0)
+    # The duplicate occupies rank 2; b remains at rank 3, not rank 2.
+    assert val == pytest.approx((1.0 + 1.0 / math.log2(4)) / (1.0 + 1.0 / math.log2(3)))
     assert ndcg_at_k(["a", "a", "x"], {"a"}, k=3) == pytest.approx(1.0)
 
 

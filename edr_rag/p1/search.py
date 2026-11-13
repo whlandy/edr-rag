@@ -496,9 +496,17 @@ class JsonlCorpus:
             meta = r.get("metadata") or {}
             title = r.get("title") or meta.get("title") or ""
             operation = r.get("operation") or meta.get("operation") or ""
-            key = hashlib.sha1(
-                f"{content}\x00{title}\x00{operation}".encode("utf-8")
-            ).hexdigest()
+            # Equal text does not imply equal applicability or authorization.
+            # Keep metadata and top-level scope in the key, otherwise a copy
+            # visible to one tenant/version can erase another tenant's copy.
+            scope = {k: r.get(k) for k in (
+                "tenant", "device", "manual_id", "product", "platform",
+                "version", "product_version", "document_version",
+            )}
+            key = hashlib.sha256(json.dumps(
+                [content, title, operation, meta, scope],
+                ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()
             rep = seen.get(key)
             if rep is not None:
                 rep_of[str(r["id"])] = rep

@@ -19,6 +19,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -132,16 +134,39 @@ class IncrementalIndexResult:
         return len(self.added) + len(self.updated) + len(self.removed)
 
 
-def _record_fingerprint(r: dict, text_field: str) -> str:
-    """对单条记录的嵌入文本计算稳定指纹 (sha1)，用于增量变更判定。
+def _storage_keys(records: list[dict], id_field: str) -> list[str]:
+    """Allocate duplicate keys without colliding with genuine suffixed IDs."""
+    raw = [str(r.get(id_field) or f"rec_{i}") for i, r in enumerate(records)]
+    reserved = set(raw)
+    used: set[str] = set()
+    keys = []
+    for rid in raw:
+        key = rid
+        suffix = 2
+        while key in used or (key != rid and key in reserved):
+            key = f"{rid}#dup{suffix}"
+            suffix += 1
+        keys.append(key)
+        used.add(key)
+    return keys
 
-    P3-5: 相比整批 _content_sig，逐条指纹能让「按源 hash 只重索引变更部分」
-    成立——语料里只有少量记录变化时，仅需重嵌入变化的那几条。
-    """
-    import hashlib
 
-    text = r.get(text_field) or r.get("text") or r.get("content") or ""
-    return hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest()
+def _index_payload(r: dict, text_field: str, rec_id: str, doc_idx: int) -> dict:
+    metadata = dict(r.get("metadata") or {})
+    metadata.update({"doc_idx": doc_idx, "id": rec_id})
+    for attr in ACL_METADATA_FIELDS:
+        if r.get(attr) is not None:
+            metadata[attr] = r[attr]
+    return {
+        "text": r.get(text_field) or r.get("text") or r.get("content") or "",
+        "metadata": metadata,
+    }
+
+
+def _fingerprint(payload: Any) -> str:
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                         separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class VectorIndex:
@@ -216,14 +241,14 @@ class VectorIndex:
             return
         self._indexed_sig = self._embed_sig + ":" + stored
 
-    def _note_indexed_sig(self, records: list[dict], text_field: str) -> None:
+    def _note_indexed_sig(self, records: list[dict], text_field: str, id_field: str = "id") -> None:
         """索引成功后记录签名，并回写到持久化 store 供下次进程恢复。
 
         content 与生成它的嵌入模型标识分开落盘：恢复时二者都需匹配
         当前语料与 embedder 才允许短路，见 ``_restore_sig_from_store``。
         """
         self._dirty = True
-        content = _content_sig(records, text_field)
+        content = _content_sig(records, text_field, id_field)
         self._indexed_sig = self._embed_sig + ":" + content
         setter = getattr(self.store, "set_content_sig", None)
         if setter is not None:
@@ -256,12 +281,11 @@ class VectorIndex:
         Returns:
             实际写入条数。
         """
-        sig = self._embed_sig + ":" + _content_sig(records, text_field)
+        sig = self._embed_sig + ":" + _content_sig(records, text_field, id_field)
         if not force and self._indexed_sig == sig:
             return self.count()
-        self.store.delete(_all_ids(self.store))
-        n = self._embed_upsert(records, text_field, id_field)
-        self._note_indexed_sig(records, text_field)
+        n = self._embed_upsert(records, text_field, id_field, replace=True)
+        self._note_indexed_sig(records, text_field, id_field)
         return n
 
     def _embed_upsert(
@@ -270,10 +294,14 @@ class VectorIndex:
         text_field: str,
         id_field: str,
         doc_indices: Optional[list[int]] = None,
+        storage_keys: Optional[list[str]] = None,
+        replace: bool = False,
+        remove_ids: Optional[list[str]] = None,
     ) -> int:
         """把一批记录嵌入并 upsert 进 store，返回实际写入 (含替换) 条数。
 
-        不清理既有记录、不碰内容签名——仅供 index_records / 增量索引内部复用。
+        嵌入全部完成后才清理待替换记录；模型失败保留原索引。
+        storage_keys 由完整语料分配，增量子集不能重新编号重复 ID。
 
         Args:
             doc_indices: 可选，与 `records` 等长的、每条记录在**完整语料**中的
@@ -282,31 +310,19 @@ class VectorIndex:
                 重嵌入子集时必须显式传入原始位置 (P3-5)。
         """
         vector_records = []
-        # 单批内同 ID 检测：PersistentVectorStore.upsert 按 ID 覆盖，静默
-        # 后写覆盖 = 数据丢失（1433 审核漏洞 #2）。批内消歧为唯一存储键，
-        # 原始 id 保留在 metadata（检索经 doc_idx 回记录，后缀不外泄）。
-        seen_ids: dict[str, int] = {}
+        keys = storage_keys if storage_keys is not None else _storage_keys(records, id_field)
         for i, r in enumerate(records):
-            text = r.get(text_field) or r.get("text") or r.get("content") or ""
+            rec_id = str(r.get(id_field) or f"rec_{i}")
+            real_idx = doc_indices[i] if doc_indices is not None else i
+            payload = _index_payload(r, text_field, rec_id, real_idx)
+            text = payload["text"]
             if not text.strip():
                 continue
             vec = self.embed(text)
             if not vec:
-                continue
-            rec_id = str(r.get(id_field) or f"rec_{i}")
-            n = seen_ids.get(rec_id, 0) + 1
-            seen_ids[rec_id] = n
-            store_id = rec_id if n == 1 else f"{rec_id}#dup{n}"
-            real_idx = doc_indices[i] if doc_indices is not None else i
-            meta: dict[str, Any] = {"doc_idx": real_idx, "id": rec_id}
-            meta.update(r.get("metadata") or {})
-            # ACL 维度提升为顶层 metadata，使权限谓词能在存储层下推 (P4)。
-            # 顶层字段优先于 metadata 内嵌值，与 security._record_acl_field
-            # 的读取顺序保持一致。
-            for attr in ACL_METADATA_FIELDS:
-                val = r.get(attr)
-                if val is not None:
-                    meta[attr] = val
+                raise ValueError(f"empty embedding for {rec_id}")
+            store_id = keys[i]
+            meta = payload["metadata"]
             vector_records.append(
                 VectorRecord(
                     id=store_id,
@@ -315,6 +331,13 @@ class VectorIndex:
                     text=text,
                 )
             )
+        # Finish embedding before modifying the live store. A model failure must
+        # leave its previous records and signature intact.
+        self._indexed_sig = None
+        if replace:
+            self.store.delete(_all_ids(self.store))
+        elif remove_ids:
+            self.store.delete(remove_ids)
         return self.store.upsert(vector_records) if vector_records else 0
 
     def index_records_incremental(
@@ -332,6 +355,8 @@ class VectorIndex:
           - 消失 (removed)   : 从存储删除；
           - 未变 (unchanged) : 跳过，不重嵌入 (省去反复嵌入的开销)。
         仅对 added+updated 做嵌入、对 removed 做删除；未变记录保持原向量不动。
+        变更判定包含模型、metadata/ACL 和 doc_idx；位置变化也需更新，
+        避免搜索结果仍指向删除或重排前的语料行。
 
         Args:
             records: 当前语料记录列表。
@@ -350,18 +375,14 @@ class VectorIndex:
         added: list[str] = []
         updated: list[str] = []
         unchanged: list[str] = []
-        # 同批内同 ID 消歧（与 _embed_upsert 同一方案）：重复 ID 是实质
-        # 不同的变体，共享键会让 by_id/orig_index/new_known 收敛到最后一
-        # 变体——前位变体变化时以错误文本在错误位置重嵌入（1433 审核漏洞
-        # #2 的增量形状）。批内第 2..n 次出现的 ID 记为 <id>#dupN。
-        seen_ids: dict[str, int] = {}
-
+        keys = _storage_keys(records, id_field)
         for i, r in enumerate(records):
             rec_id = str(r.get(id_field) or f"rec_{i}")
-            n = seen_ids.get(rec_id, 0) + 1
-            seen_ids[rec_id] = n
-            key = rec_id if n == 1 else f"{rec_id}#dup{n}"
-            fp = _record_fingerprint(r, text_field)
+            key = keys[i]
+            fp = _fingerprint({
+                "embedder": self._embed_sig,
+                "record": _index_payload(r, text_field, rec_id, i),
+            })
             new_known[key] = fp
             by_id[key] = r
             orig_index[key] = i
@@ -381,13 +402,15 @@ class VectorIndex:
         # JsonlCorpus 依靠它映射回 self.records (P3-5)。
         doc_indices = [orig_index[rid] for rid in changed_ids]
         if to_index:
-            self._embed_upsert(to_index, text_field, id_field, doc_indices=doc_indices)
+            self._embed_upsert(to_index, text_field, id_field,
+                               doc_indices=doc_indices, storage_keys=changed_ids,
+                               remove_ids=changed_ids)
         if removed:
             self.store.delete(removed)
 
         # 让 index_records 的整批签名短路与新状态一致，避免紧随其后的
         # 全量重建被误触发。
-        self._note_indexed_sig(records, text_field)
+        self._note_indexed_sig(records, text_field, id_field)
 
         return (
             IncrementalIndexResult(
@@ -470,16 +493,14 @@ def _embedder_sig(embed: Callable[[str], list[float]]) -> str:
     return f"{getattr(embed, '__module__', '?')}.{getattr(embed, '__qualname__', '?')}"
 
 
-def _content_sig(records: list[dict], text_field: str) -> str:
-    """对记录的嵌入文本内容做轻量 hash，用于判断是否需要重建索引。
+def _content_sig(records: list[dict], text_field: str, id_field: str = "id") -> str:
+    """Versioned signature of texts, boundaries, identities and stored metadata.
 
-    相比仅比较长度，内容级签名能在语料被重新摄取 (文本变化而条数不变) 时
-    正确触发重建，避免检索到陈旧向量；哈希开销远低于重新嵌入，可接受。
+    Old text-only signatures intentionally mismatch once. Merely changing ACLs
+    or IDs must invalidate persisted mappings even when embeddings are unchanged.
     """
-    import hashlib
-
-    h = hashlib.sha1()
-    for r in records:
-        text = r.get(text_field) or r.get("text") or r.get("content") or ""
-        h.update(text.encode("utf-8", "ignore"))
-    return h.hexdigest()
+    return "v2:" + _fingerprint([
+        {"key": key, "record": _index_payload(
+            r, text_field, str(r.get(id_field) or f"rec_{i}"), i)}
+        for i, (r, key) in enumerate(zip(records, _storage_keys(records, id_field)))
+    ])
