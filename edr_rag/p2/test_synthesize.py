@@ -9,6 +9,7 @@
   - to_jsonl / answer_to_text 序列化
 """
 
+from edr_rag.llm.base import LLMInsufficientEvidenceError
 from edr_rag.p2.synthesize import (
     SynthesizedAnswer,
     answer_to_text,
@@ -86,6 +87,50 @@ def test_synthesize_llm_exception_falls_back_to_assemble():
     result = synthesize_answer("如何配置代理", ctx, llm=broken_llm)
     assert result.generated_by == "assemble"
     assert "配置代理服务器" in result.answer
+
+
+def test_synthesize_llm_insufficient_evidence_refuses():
+    """LLM 判证据不足 -> refused，不回落组装按 answered 输出步骤（缺口1）。"""
+    def refusing_llm(q, c):
+        raise LLMInsufficientEvidenceError("model judged evidence insufficient")
+
+    ctx = {"actions": [_make_action()], "procedures": [], "sections": []}
+    result = synthesize_answer("如何配置代理", ctx, llm=refusing_llm)
+    assert result.answer_status == "refused"
+    assert result.refusal_reason == "insufficient_evidence_llm"
+    assert result.requires_confirmation is True
+    # 拒答文本来自确定性拒答组装，不含编造的步骤指令
+    assert "证据不足" in result.answer
+    assert "输入代理地址" not in result.answer
+
+
+def test_synthesize_llm_insufficient_evidence_keeps_conflict_status():
+    """确定性冲突检测优先：conflict 状态不被 LLM 拒答覆盖。"""
+    def refusing_llm(q, c):
+        raise LLMInsufficientEvidenceError("model judged evidence insufficient")
+
+    a1 = {
+        "id": "安全.防护.启用防火墙", "action_id": "安全.防护.启用防火墙",
+        "title": "启用防火墙", "risk": "high", "status": "needs_review",
+        "confidence": 0.9, "requires_confirmation": True,
+        "procedure": [{"order": 1, "action": "enable", "target": "防火墙",
+                       "source_instruction": "启用防火墙"}],
+        "source": {"manual_id": "m", "procedure_id": "procedure.安全.启用",
+                   "file": "security/fw.html"},
+        "score": 5.0,
+    }
+    a2 = dict(a1)
+    a2.update(
+        id="安全.防护.禁用防火墙", action_id="安全.防护.禁用防火墙",
+        title="禁用防火墙",
+        source={"manual_id": "m", "procedure_id": "procedure.安全.禁用",
+                "file": "security/fw2.html"},
+        procedure=[{"order": 1, "action": "disable", "target": "防火墙",
+                    "source_instruction": "禁用防火墙"}],
+    )
+    ctx = {"actions": [a1, a2], "procedures": [], "sections": []}
+    result = synthesize_answer("处理防火墙", ctx, llm=refusing_llm)
+    assert result.answer_status == "conflict"
 
 
 def test_synthesize_empty_context_no_crash():

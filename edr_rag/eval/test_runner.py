@@ -284,6 +284,42 @@ def test_generation_summary_refusal_metrics(workdir):
     assert kw["high_risk"] == 1.0  # 唯一应识别高风险的 qr2 被正确识别
 
 
+def test_run_eval_llm_insufficient_evidence_marks_refusal(workdir):
+    """llm 注入（缺口2）+ LLM 判证据不足拒答（缺口1）端到端：
+
+    组装模式拒答失效（[20261111-2057] 实证 30/30 answered）；注入会抛
+    LLMInsufficientEvidenceError 的 llm 后，expected_refusal 的查询应记
+    refused 且 refusal_correct 生效。
+    """
+    from edr_rag.llm.base import LLMInsufficientEvidenceError
+
+    def refusing_llm(q, c):
+        # 对应拒答标注的查询判证据不足；其余照常返回生成文本
+        if "同事" in q or "私有文件" in q:
+            raise LLMInsufficientEvidenceError("insufficient")
+        return f"LLM回答：{q}"
+
+    evalset = _gen_eval_set()
+    report = run_eval(workdir, evalset, strategies=("keyword",), llm=refusing_llm)
+    rows = {r.qid: r for r in report.rows}
+    # qr1 应拒答 -> LLM 拒答生效
+    assert rows["qr1"].answer.answer_status == "refused"
+    assert rows["qr1"].generation_metrics.get("refusal_correct") == 1.0
+    # qr2/qr3 应作答 -> LLM 生成文本被采用（qr2 未标 expected_refusal，
+    # 不产生 refusal_correct 指标——指标只对有标注的查询计算）
+    assert rows["qr2"].answer.answer_status == "answered"
+    assert rows["qr2"].answer.generated_by == "llm"
+    assert "refusal_correct" not in rows["qr2"].generation_metrics
+
+
+def test_run_eval_default_no_llm_unchanged(workdir):
+    """缺省 llm=None 时行为与既有组装路径完全一致（回归保护）。"""
+    evalset = _gen_eval_set()
+    report = run_eval(workdir, evalset, strategies=("keyword",))
+    rows = {r.qid: r for r in report.rows}
+    assert rows["qr2"].answer.generated_by == "assemble"
+
+
 def test_load_eval_set_parses_annotation_bools(workdir):
     data = workdir / "gen.jsonl"
     data.write_text(

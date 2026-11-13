@@ -19,6 +19,11 @@ try:
 except ImportError:  # pragma: no cover
     BeautifulSoup = None
 
+try:
+    from bs4.element import PreformattedString as _PreformattedString
+except ImportError:  # pragma: no cover - bs4 < 4.x layout fallback
+    _PreformattedString = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -57,6 +62,13 @@ def _clean_text(element) -> str:
 
     def _walk(elm):
         for child in elm.children:
+            if _PreformattedString is not None and isinstance(
+                child, _PreformattedString
+            ):
+                # Doctype/Comment/ProcessingInstruction 均为 PreformattedString
+                # 子类；缺陷④ [0652]：仅判 NavigableString 时 Doctype 漏过，
+                # 声明文本进入 content（两手册 sections 100% 前缀泄漏）。
+                continue
             if isinstance(child, NavigableString):
                 t = str(child).strip()
                 if t:

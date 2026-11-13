@@ -252,6 +252,38 @@ def test_render_untagged_mode():
     assert "c" in out
 
 
+def test_extract_item_text_prefers_full_text_over_snippet():
+    """_rerank_text（完整正文）存在时优先于 120 字 snippet（LLM 证据供给）。"""
+    from edr_rag.security import _extract_item_text
+
+    item = {
+        "title": "t",
+        "snippet": "短摘要",
+        "_rerank_text": "完整正文中段。1. 单击确定。2. 单击保存。",
+    }
+    out = _extract_item_text(item)
+    assert "完整正文中段" in out
+    assert "短摘要" not in out
+
+
+def test_extract_item_text_falls_back_without_full_text():
+    """无 _rerank_text 时回落 snippet/content/text，与既有行为一致。"""
+    from edr_rag.security import _extract_item_text
+
+    assert _extract_item_text({"title": "t", "snippet": "s"}) == "t | s"
+    assert _extract_item_text({"title": "t", "content": "c"}) == "t | c"
+    assert _extract_item_text({"title": "t"}) == "t"
+
+
+def test_render_isolated_context_uses_full_text():
+    out = render_isolated_context(
+        [{"title": "t", "snippet": "短", "_rerank_text": "正文很长" * 50}],
+        "q",
+    )
+    assert "正文很长" in out
+    assert "短 |" not in out
+
+
 # ---------- 集成: RetrievalService + ACL ----------
 
 

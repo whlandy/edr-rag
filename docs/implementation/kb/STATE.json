@@ -1,0 +1,63 @@
+{
+  "run_id": "20261113-0224-final-closeout",
+  "updated_at": "2026-11-13T02:58:00+08:00",
+  "phase": "P2",
+  "git_head": "224a597280cfcf612223a02f70990bdbcad64eff",
+  "dirty_files": 34,
+  "current_task": {
+    "title": "final closeout：验证器契约修复+正式索引事实更正+最终清单补齐+a-04 更正",
+    "status": "delivered_pending_user_ratification",
+    "evidence": "optimization-runs/20261113-0224-final-closeout/REPORT.md",
+    "result": "用户独立复核通过（自测/整体校验/42 SHA256/快照一致）；两处交付文档文字修正后重新生成清单 42/42 OK；HYBRID-COMPARISON 两处残留表述已限定/删除；README 解释器更正为 3.14.5 实际路径；a-04 明确为已知 Top-5 回归；调度器确认 edr-rag-optimizer enabled=false。封存。"
+  },
+  "next_tasks": [
+    "（任务已停止）如重启：先追认 D-20261112-1824-1 / D-20261112-2003-1，再从候选激活流程开始"
+  ],
+  "decisions_pending": [
+    "D-20261112-1824-1 追认：ingest 消歧范围限定 A（含顺序无关性修复）",
+    "D-20261112-2003-1 追认（修订版）：fact_groups 附加注解，relevant 保留旧 gold",
+    "a-04 已知 Top-5 回归（rank1→7-10 位，消歧后变体竞争）：实际效果回归，正式激活前需明确决定是否接受",
+    "正式激活审批本身（候选保留≠批准激活）"
+  ],
+  "known_defects": {
+    "resolved": [
+      "nDCG>1 (1044)",
+      "LLM 证据截断 (0000)",
+      "vector 冷载重嵌入 (0000 前)",
+      "内容级重复挤占 (本轮读取侧缓解)",
+      "chunks 内容级去重键升级方案 B (本轮)：title 差异组 31 组不再并组，[0659] 两处未补偿移除恢复",
+      "DOCTYPE 泄漏（缺陷④）两层修复：真实链 10009 泄漏行→0，bm25 词法零回退 (0819)",
+      "缺陷④b（0819 覆盖缺口）：递归剥离 metadata.recovery + _load_nodes 路径补防，真实链 8 路径泄漏 0 (0930)",
+      "缺陷④构建期覆盖缺口：build-nodes 从含泄漏冻结上游重建会复现泄漏——构建期剥离 + 双手册 nodes.jsonl 重建，磁盘泄漏 0 (1031)",
+      "success@K 指标接入确认：query_metrics/summary/渲染已内置（0819 前），遗留项闭环 (1112)",
+      "模型指纹持久化（1605）：磁盘 meta 新增 embedder_sig；跨进程换模型 fail-closed 强制重建；旧格式索引兼容零写盘（TDD 4 例红→绿）",
+      "同 ID 异内容身份契约（1617）：读取侧变体消歧 _doc_id=#dupN + 索引层同批防御；upsert 后写覆盖/增量错位两形状关闭（TDD 5 例红→绿，全量 1092）",
+      "同 ID 异内容 upsert 覆盖/增量错位 (1617)；重跑对照证实变体可检索且指标影响=2/103 排位 (1714)"
+    ],
+    "open": [
+      "ingest 层 ID 碰撞根因（ingest A/B/C 关联）：读取侧已消歧，磁盘产物 ID 仍碰撞（chunks 67/119 组）",
+      "机制 B 语义近邻挤压（reranker 决策项）",
+      "组装模式拒答失效根因已定位、LLM 链路修复待远程端点或 2B 标定扩展"
+    ]
+  },
+  "incidents": [
+    "20261112-0512: 本轮进程覆盖冻结 workdir 的 vector_index 派生缓存（JSONL 本体未动；frozen 重放数值弃用，对照采用 [0244]/[2000] 归档；dedup 数值有效）",
+    "20261112-1433: [1112] hybrid 归档基线实为 keyword+bm25 降级模式数值（embedder HF 下载失败静默降级，anquan 缓存 sig 不匹配+mtime 不变为决定性证据）；duli sections 派生缓存本轮重建（JSONL 本体未动）；历史『vector_index 未触碰』时段 hybrid 数值引用前须核对缓存证据",
+    "20261112-1433 CORRECTION: 原报告三处错误已更正（降级=三路重复非两路；HF 失败降为假设；『只读复算』撤回——查询链含自动重建写盘）。修复已实施：真嵌入探针+通道声明+隔离索引+禁重复回退（TDD 8 例，全量 1083 passed）。双进程隔离一致性确认；duli 真 hybrid 基线 R@K 0.9296 落盘。"
+  ],
+  "procedures_dedup_conclusion": "procedures 无内容级重复（同 ID 等价行已覆盖），该项关闭",
+  "task_status": "STOPPED_BY_USER",
+  "delivered": [
+    "候选固化：candidates/20261112-2003-id-disambiguation/（42 文件 SHA256 清单+代码快照+验证器快照+复现命令）",
+    "验证器契约修复+正负例自测（eval_v2/verify_sources.py + test_verify_fact_groups.py）",
+    "事实级指标 fact_recall@k / fact_mrr + 正负例（edr_rag/eval/）",
+    "双手册 hybrid 对照 + 归因（HYBRID-COMPARISON.md，含 a-04 已知 Top-5 回归结论）",
+    "正式索引修改事实三处文档统一（README/HYBRID-COMPARISON/STATE）"
+  ],
+  "not_activated": [
+    "正式原始语料（sections/chunks/nodes/procedures JSONL ×2）：冻结版本，5/5 sha256 与 [1824] 一致——未激活候选替换",
+    "正式知识库服务/检索数据源：未切换到候选",
+    "正式派生缓存 anquan/vector_index/sections.{meta,vec}：曾被重建（2026-11-12 22:16 CST，签名失配 fail-closed 路径，输入=正式冻结语料；当前指纹 d01446a6…/0524b77a…，旧整文件指纹未留存）——见候选 README 修改事实节",
+    "正式派生缓存其余 10 文件（duli 全部 + anquan nodes/procedures）：未动"
+  ]
+}

@@ -85,6 +85,16 @@ class LLMResponse:
         )
 
 
+class LLMInsufficientEvidenceError(Exception):
+    """模型判定检索证据不足以回答用户请求。
+
+    由 ``make_synthesize_callable`` 适配层在模型返回
+    ``evidence_sufficient=false`` 时抛出，``synthesize_answer`` 捕获后把
+    ``answer_status`` 置为 ``refused`` —— 与确定性拒答共用同一套状态口径，
+    避免「模型说证据不足、组装路径却按 answered 输出编造步骤」的分裂。
+    """
+
+
 class LLMClient(ABC):
     """生成侧客户端的最小接口。
 

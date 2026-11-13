@@ -137,6 +137,70 @@ _embedder_fn: Optional[Callable[[str], list[float]]] = None
 _embedder_model = None
 _embedder_lock = threading.Lock()
 
+#: 嵌入器真可用性探测（20261112-1433 事故修复）：import 可用不代表模型
+#: 可加载/可推理。首次使用前试嵌入一个固定探针文本，失败即判不可用
+#: （进程内缓存判定结果）。embedder_status() 报告三态：
+#:   active  探针嵌入成功，vector 路真实可用
+#:   failed  import 可用但探针失败（模型加载/推理不可用）——不可用
+#:   absent  依赖不可导入——不可用
+_PROBE_TEXT = "向量通道探针"
+_probe_done = False
+_probe_ok: Optional[bool] = None
+
+
+def embedder_status() -> str:
+    """返回嵌入器通道状态：'active' | 'failed' | 'absent'。
+
+    触发探测（进程内仅一次）。评测/检索链应在输出头部声明该状态，
+    使归档数值自带模式证据（keyword+bm25+vector 三路 / 两路）。
+    """
+    fn = _optional_embedder()
+    if fn is None:
+        # 区分 failed（import 过但探针失败）与 absent（依赖缺失）
+        if _probe_done and _probe_ok is False:
+            return "failed"
+        if _embedder_checked and _embedder_fn is None:
+            return "absent"
+        # 未探测过时探测一次
+        _probe_embedder()
+        if _probe_done and _probe_ok is False:
+            return "failed"
+        return "absent"
+    # fn 非 None：确保探针已真实运行过（1433 教训——"看似可用"必须验证）
+    if not _probe_done:
+        if not _probe_embedder():
+            return "failed"
+    elif _probe_ok is False:
+        return "failed"
+    return "active"
+
+
+def _probe_embedder() -> bool:
+    """真嵌入探针文本，判定并缓存嵌入器可用性。幂等。"""
+    global _probe_done, _probe_ok
+    with _embedder_lock:
+        if _probe_done:
+            return bool(_probe_ok)
+        _probe_done = True
+        _probe_ok = False
+        fn = _embedder_fn
+        if fn is None:
+            # import 探测尚未运行时先跑一遍
+            fn = _optional_embedder()
+        if fn is None:
+            return False
+        try:
+            vec = fn(_PROBE_TEXT)
+            _probe_ok = isinstance(vec, list) and len(vec) > 0
+        except Exception:
+            logger.error(
+                "embedder probe failed: import 可用但模型加载/推理失败，"
+                "vector 路判定为不可用（不静默降级伪装）",
+                exc_info=True,
+            )
+            _probe_ok = False
+        return bool(_probe_ok)
+
 
 def _load_embed_model():
     """惰性构造嵌入模型 (进程内仅一次)。"""
@@ -156,9 +220,16 @@ def _optional_embedder() -> Optional[Callable[[str], list[float]]]:
     missing optional dependency — the main chain stays on keyword/BM25.
 
     P4: 探测结果与模型实例均为模块级单例，重复调用零开销。
+
+    1433 修复：返回非 None 前先做一次真嵌入探针；探针失败（模型加载/
+    推理不可用）同样返回 None——import 可用性不再是"向量路可用"的判据。
+    探针失败原因经 embedder_status() 以 'failed' 状态与 error 日志暴露。
     """
     global _embedder_checked, _embedder_fn
     if _embedder_checked:
+        # 1433 修复：探针已判失败时缓存值不再可信，返回 None。
+        if _probe_done and _probe_ok is False:
+            return None
         return _embedder_fn
     with _embedder_lock:
         if _embedder_checked:  # 双检锁：等锁期间可能已被别的线程完成探测
@@ -172,21 +243,32 @@ def _optional_embedder() -> Optional[Callable[[str], list[float]]]:
                 vec = _load_embed_model().get_text_embedding(text)
                 return list(vec)
 
+            # 供 vectorstore._embedder_sig 识别模型：换嵌入模型时内容签名
+            # 随之失效，持久化短路不会服务旧模型的陈旧向量。
+            _embed.model_id = f"hf:{EMBED_MODEL}"  # type: ignore[attr-defined]
             _embedder_fn = _embed
         except Exception:  # pragma: no cover - optional deps absent
             logger.debug("optional RAG embedder unavailable; using BM25 fallback")
             _embedder_fn = None
         _embedder_checked = True
+    # 1433 修复：import 探测通过后立即做真嵌入探针。探针失败（模型加载/
+    # 推理不可用）把嵌入器判为不可用——调用方拿到 None，vector_search 走
+    # "缺依赖"分支，hybrid 不再把降级 BM25 伪装成向量路。
+    if _embedder_fn is not None and not _probe_embedder():
+        _embedder_fn = None
     return _embedder_fn
 
 
 def reset_embedder_cache() -> None:
     """重置嵌入探测与向量缓存 (测试用；生产不应调用)。"""
     global _embedder_checked, _embedder_fn, _embedder_model
+    global _probe_done, _probe_ok
     with _embedder_lock:
         _embedder_checked = False
         _embedder_fn = None
         _embedder_model = None
+        _probe_done = False
+        _probe_ok = None
     with _EMBED_CACHE_LOCK:
         _EMBEDDER_CACHE.clear()
 
@@ -277,6 +359,18 @@ def reset_index_cache() -> None:
 
 # ---------- Corpus ----------
 
+#: 缺陷④ [0652] 读取侧防御：泄漏的 DOCTYPE 声明。根因在
+#: parse_html._walk（Doctype 子类漏过 NavigableString 判定，已修），此处
+#: 兜底存量产物（两手册 sections 100% 前缀泄漏 + chunks/nodes 前缀型与
+#: 跨节拼接的中部型「恢复: PUBLIC …」）。签名取「PUBLIC "//DTD…" "URL"」
+#: 双引号对——DTD 标识符必带 //DTD；前导 html 可缺（中部型）。
+#: 实测两手册四语料 100% 覆盖、0 误伤（//DTD 签名正文不出现）。
+_LEAKED_DOCTYPE_RE = re.compile(
+    r'(?:\bhtml\s+)?\bPUBLIC\s+"[^"]*//DTD[^"]*"\s+"[^"]*"\s*',
+    re.IGNORECASE,
+)
+
+
 class JsonlCorpus:
     """A searchable corpus over one or more JSONL artifact files.
 
@@ -291,10 +385,22 @@ class JsonlCorpus:
         namespace: Optional[str] = None,
         vector_dir: Optional[Path] = None,
     ):
+        # 内容级去重的 id→代表 映射；仅 from_file 路径填充。
+        self._rep_of: dict[str, str] = {}
         # Normalize each record into a searchable doc
         self.records = []
         for r in records:
-            self.records.append(self._normalize(r))
+            self.records.append(
+                self._normalize(self._strip_doctype_leak(r))
+            )
+        # 同 ID 异内容身份契约（1433 审核漏洞 #2）：检索等价去重后仍同 ID
+        # 的行是**实质不同的变体**（实测 duli「登录_管理面」三变体浏览器
+        # 要求不同）。若共享 _doc_id，向量 upsert 后写覆盖只剩最后一变体、
+        # 增量索引按 ID 收敛会以最后变体文本错位重嵌入。给非首现变体分配
+        # 带序号的内部 _doc_id（upsert 键唯一化）；公开 id 字段保持原值
+        # （gold/引用/get() 语义不变），_to_result 公开口输出公开 id。
+        # 必须在 _normalize 之后运行（_normalize 会重写 _doc_id = id）。
+        self._disambiguate_duplicate_ids(self.records)
 
         self.namespace = namespace
         self.vector_dir = vector_dir
@@ -307,23 +413,195 @@ class JsonlCorpus:
         self._build_bm25()
 
     @staticmethod
-    def from_file(path: Path) -> "JsonlCorpus":
-        """从 JSONL 构造语料，并由文件名/位置推导向量 namespace 与持久化目录。"""
+    def _dedupe_identical_id_rows(records: list[dict]) -> tuple[list[dict], int]:
+        """同 ID 且检索语义完全一致的重复行只保留首次出现 (缺陷②最小缓解)。
+
+        背景：ingest 按「导航路径」拼 section ID，同一导航路径在多个 topic
+        HTML 反复出现导致跨文件 ID 碰撞（anquan 17 组 / duli 11 组重复）。
+        其中「除 source_ref/links 外逐字段相同」的组在检索上是等价副本：
+        keyword/bm25 重复计分挤占 top-k，vector upsert 按 ID 覆盖只剩一行。
+        本函数在**读取侧**去重这类组（不改磁盘产物、不改 ID）；
+        「内容确实不同」的同 ID 组保持原样（哪个变体可见属 ingest 缺陷，
+        需另行决策），provenance 取保留行的 source_ref。
+
+        等价判据：id + 参与检索/展示/上下文组装的全部字段相同
+        (title/headings/section_path/content/metadata 及其余非 _ 字段)，
+        仅 links/images/source_ref 允许不同——三者均不进入 _searchable
+        (见 _normalize)，且检索链路无消费方。
+        """
+        if not records:
+            return records, 0
+        seen: dict[str, str] = {}
+        out: list[dict] = []
+        dropped = 0
+        for r in records:
+            rid = r.get("id") or ""
+            payload = json.dumps(
+                {k: v for k, v in r.items() if k not in ("source_ref", "links", "images")},
+                sort_keys=True,
+                ensure_ascii=False,
+            )
+            key = f"{rid}\x00{hashlib.sha1(payload.encode('utf-8')).hexdigest()}"
+            if rid and key in seen:
+                dropped += 1
+                continue
+            if rid:
+                seen[key] = rid
+            out.append(r)
+        return out, dropped
+
+    # 内容级去重的分组阈值：短内容（导航锚点/样板节）不参与分组，
+    # 避免把合法短节误并（[0310] 可行性评估确定）。
+    _CONTENT_DEDUP_MIN_LEN = 200
+
+    @staticmethod
+    def _dedupe_content_rows(
+        records: list[dict],
+    ) -> tuple[list[dict], dict[str, str]]:
+        """不同 ID 但 content 逐字节相同的行只保留首现行为代表（读取侧）。
+
+        背景：两本手册存在大面积同内容多 ID 节（anquan 66 组 / duli 212 组，
+        [0258]/[0310] 已量化）：双配置树镜像 + 跨角色视角重复。相同内容 →
+        相同向量 → 检索语义并列，挤占 top-k（duli vector 9 行因此 gold 出
+        top-5）。本函数在读取侧移除非代表行（磁盘产物不改、ID 不改），
+        组内差异经实证仅 section_path（导航树位置），title/metadata/headings
+        逐字段一致（anquan/duli 66+212 组全部如此，实机核验）。
+
+        前置要求：先执行 _dedupe_identical_id_rows（同 ID 等价行已收敛），
+        否则同 ID 组内可能被本函数按内容错误并组。
+
+        返回 (保留行列表, id→代表 id 映射)。映射必须通过
+        ``representative_id`` 公共查询口消费——eval gold 重映射、引用渲染
+        （synthesize 层）、nodes 语料重建后的评测对齐共用同一份映射，
+        不各自维护（[0440] 结论三）。
+        """
+        if not records:
+            return records, {}
+        seen: dict[str, str] = {}
+        out: list[dict] = []
+        rep_of: dict[str, str] = {}
+        for r in records:
+            # 正文在 content（sections/procedures）或 text（chunks/nodes），
+            # 与 _normalize 的取值口径一致；缺陷③ [0652]：此前只读 content，
+            # chunks 语料静默不参与内容级去重。
+            content = r.get("content") or r.get("text") or ""
+            if len(content) < JsonlCorpus._CONTENT_DEDUP_MIN_LEN:
+                out.append(r)
+                continue
+            # D-0659-1 方案 B：键升级为 content|text + title + operation。
+            # chunks 组内 title/operation 可不同（[0659] 实测 31 组，含跨功能
+            # 同文组），title/operation 参与 _searchable 打分 → 仅内容键会
+            # 并组检索不等价的行。sections 组内差异仅 section_path（[0512]
+            # 逐字段核验），title 一致时行为不变。
+            meta = r.get("metadata") or {}
+            title = r.get("title") or meta.get("title") or ""
+            operation = r.get("operation") or meta.get("operation") or ""
+            key = hashlib.sha1(
+                f"{content}\x00{title}\x00{operation}".encode("utf-8")
+            ).hexdigest()
+            rep = seen.get(key)
+            if rep is not None:
+                rep_of[str(r["id"])] = rep
+                continue
+            seen[key] = str(r["id"])
+            out.append(r)
+        return out, rep_of
+
+    @classmethod
+    def from_file(cls, path: Path) -> "JsonlCorpus":
+        """从 JSONL 构造语料，并由文件名/位置推导向量 namespace 与持久化目录。
+
+        读取侧两级去重（磁盘 JSONL 本身不被修改）：
+        1. 同 ID 且除 source_ref/links/images 外逐字段相同的重复行
+           （ingest ID 碰撞最小缓解，见 _dedupe_identical_id_rows）；
+        2. 不同 ID 但 content 逐字节相同的行收敛为首现代表
+           （见 _dedupe_content_rows）。
+        """
         path = Path(path)
         records = []
         with path.open(encoding="utf-8") as f:
             for line in f:
                 if line.strip():
                     records.append(json.loads(line))
+        # 缺陷④：先剥离 DOCTYPE 泄漏再去重（去重键含 content|text）。
+        records = [cls._strip_doctype_leak(r) for r in records]
+        records, _dropped = cls._dedupe_identical_id_rows(records)
+        records, rep_of = cls._dedupe_content_rows(records)
         # sections.jsonl -> 'sections'；ocr.jsonl -> 'ocr'。
         namespace = path.name[: -len(".jsonl")] if path.name.endswith(".jsonl") else path.stem
+        import os as _os
+
         from edr_rag.vectorstore import vector_dir_for_workdir
 
-        return JsonlCorpus(
+        env_dir = _os.environ.get("EDR_RAG_VECTOR_DIR", "").strip()
+        # 1433 修复：评测隔离——EDR_RAG_VECTOR_DIR 设置时向量持久化重定向，
+        # 查询触发的自动重建不再写入正式 workdir 的 vector_index。
+        vector_dir = Path(env_dir) if env_dir else vector_dir_for_workdir(path.parent)
+
+        corpus = JsonlCorpus(
             records,
             namespace=namespace or None,
-            vector_dir=vector_dir_for_workdir(path.parent),
+            vector_dir=vector_dir,
         )
+        corpus._rep_of = rep_of
+        return corpus
+
+    @staticmethod
+    def _disambiguate_duplicate_ids(records: list[dict]) -> list[dict]:
+        """给同 ID 异内容变体的非首现行分配唯一内部 _doc_id（读取侧）。
+
+        首现行 _doc_id = 公开 id（规范代表）；第 2..n 个变体为
+        ``<id>#dup2``、``<id>#dup3``…（仅作向量 upsert 键与内部映射，
+        公开 id 字段不改——gold 对齐、引用定位、get() 主键查询全部仍走
+        原始 ID）。_normalize 在 from_file 内先于本函数运行时已写过
+        _doc_id，这里直接覆写；裸构造路径无重复时零改写。
+        """
+        if not records:
+            return records
+        seen: dict[str, int] = {}
+        for r in records:
+            rid = str(r.get("id") or "")
+            if not rid:
+                continue
+            n = seen.get(rid, 0) + 1
+            seen[rid] = n
+            if n > 1:
+                r["_doc_id"] = f"{rid}#dup{n}"
+        return records
+
+    def representative_id(self, record_id: str) -> str:
+        """返回该记录 ID 在内容级去重后的代表 ID。
+
+        语料中已存在的 ID 原样返回；被去重收敛的 ID 返回其组代表。
+        消费方（eval gold 重映射、引用渲染、nodes 评测对齐）必须经此
+        口查询，不得各自维护映射（[0440] 结论三）。
+        """
+        return self._rep_of.get(record_id, record_id)
+
+    @classmethod
+    def _strip_doctype_leak(cls, r: dict) -> dict:
+        """剥离泄漏的 DOCTYPE 声明（缺陷④，读取侧）。
+
+        递归覆盖：前缀型整段删除；chunks/nodes 跨节拼接的中部型
+        （「恢复: PUBLIC …」）按同一签名删除。顶层 content/text 之外，
+        metadata.recovery 等嵌套字符串字段同样泄漏（缺陷④b，anquan
+        chunks 276 / nodes 304 行），签名 //DTD 已验证 0 误伤，与字段
+        位置无关。必须发生在内容级去重之前——去重键为 content|text，
+        剥离先行才能让仅泄漏空白差异的孪生行并组。
+        """
+        return cls._strip_leak_value(r)
+
+    @classmethod
+    def _strip_leak_value(cls, v):
+        if isinstance(v, dict):
+            return {k: cls._strip_leak_value(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [cls._strip_leak_value(x) for x in v]
+        if isinstance(v, str) and "PUBLIC" in v:
+            v2 = _LEAKED_DOCTYPE_RE.sub(" ", v)
+            if v2 != v:
+                return re.sub(r"^\s+", "", v2)
+        return v
 
     @staticmethod
     def _normalize(r: dict) -> dict:
@@ -441,6 +719,7 @@ class JsonlCorpus:
         limit: int = 5,
         filter: Optional[dict[str, Any]] = None,
         allowed: Optional[set[int]] = None,
+        fallback: str = "bm25",
     ) -> list[dict]:
         """Embedding-based retrieval via the pluggable vector store (P3-1).
 
@@ -455,11 +734,17 @@ class JsonlCorpus:
             filter: 可选 metadata 谓词，在**打分之前**下推到存储层
                 (P4 ACL 谓词下推的基础)。值为 list/set/tuple 时语义是
                 「属于集合」，标量时是精确相等。
+            fallback: 运行中失败/缺依赖时的行为。
+                'bm25'（默认，公开契约）：单策略 vector 调用降级 BM25；
+                'empty'（hybrid 内部用）：返回 []，调用方不得把其它路的
+                结果伪装成向量路重复计入融合（1433 事故：keyword+BM25+BM25）。
         """
         embed_fn = _optional_embedder()
         if embed_fn is None:
             # Degrade to BM25 when LlamaIndex / embedding model is absent —
             # main chain stays green without the optional deps.
+            if fallback == "empty":
+                return []
             return self.bm25_search(query, limit=limit, allowed=allowed)
 
         try:
@@ -484,7 +769,12 @@ class JsonlCorpus:
                 hits = [(s_, i) for s_, i in hits if i in allowed]
             return [self._to_result(doc_idx, score) for score, doc_idx in hits[:limit]]
         except Exception:  # pragma: no cover - optional path only
-            logger.warning("vector_search failed; falling back to BM25", exc_info=True)
+            # 1433 修复：失败必须可观测（升级为 error），且 hybrid 语义
+            # （fallback='empty'）下返回空——降级 BM25 的结果与真 BM25 路
+            # 完全相同，混入融合等于 keyword+BM25+BM25（已实证改变排序）。
+            logger.error("vector_search failed (fallback=%s)", fallback, exc_info=True)
+            if fallback == "empty":
+                return []
             return self.bm25_search(query, limit=limit, allowed=allowed)
 
     #: 注入给 reranker 的正文上限。比 snippet 的 120 字长一个数量级，
@@ -494,7 +784,9 @@ class JsonlCorpus:
     def _to_result(self, doc_idx: int, score: float) -> dict:
         r = self.records[doc_idx]
         return {
-            "id": r["_doc_id"],
+            # 公开 id 用原始记录 id（同 ID 异内容变体共享公开 ID，
+            # _doc_id 是内部唯一 upsert 键——#dupN 后缀不外泄）。
+            "id": r.get("id") or r["_doc_id"],
             "type": r.get("type", "section"),
             "score": round(score, 3),
             "title": r["_title"],

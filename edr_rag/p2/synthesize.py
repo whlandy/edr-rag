@@ -46,7 +46,9 @@ LLM 可选（设计要点）:
     `_assemble_answer` 基于结构化字段组装。
   - 本模块不引入任何新的运行时必需依赖：LLM 仅是可选的注入函数。
   - 缺依赖时永不报错——组装路径是纯 stdlib 的确定性逻辑。
-  - 拒答/冲突状态与 answer 文本由确定性逻辑计算，LLM 出现与否都不改变状态判定。
+  - 拒答/冲突状态由确定性逻辑计算；例外是 LLM 判定证据不足（抛
+    LLMInsufficientEvidenceError）时置 refused——模型可与确定性判据一致地拒答，
+    但不能把 refused/conflict 改回 answered。其余 LLM 失败回落组装，不改变状态。
 
 输入 context 兼容两种形状（向前兼容现有检索入口）:
   1. planner_retrieve 的 dict:  {query, actions:[...], procedures:[...], sections:[...]}
@@ -59,6 +61,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Optional
+
+from ..llm.base import LLMInsufficientEvidenceError
 
 #: 允许的 answer 生成模式（供 CLI 展示）。
 ASSEMBLE_MODE = "assemble"
@@ -191,7 +195,12 @@ def _normalize_context(context: Any) -> dict:
 # ---------- 结构化字段提取 ----------
 
 
-def _resolve_source(action: dict, *, kind: str = "action") -> dict:
+def _resolve_source(
+    action: dict,
+    *,
+    kind: str = "action",
+    rep_of: Optional[dict[str, str]] = None,
+) -> dict:
     """从动作/流程/章节记录中解析来源引用（P2-2）。
 
     兼容多种形状:
@@ -200,11 +209,21 @@ def _resolve_source(action: dict, *, kind: str = "action") -> dict:
       - 扁平形状:       action["file"] / action["section_id"] /
                         action["procedure_id"] / action["source_file"] ...
 
+    rep_of: 内容级去重的 id→代表 映射（``JsonlCorpus._rep_of``，[0512]）。
+    提供时，指向被移除 ID 的 ``section_id`` 会归一为其组代表（引用可定位
+    回原文，设计 §9），同时附加 ``same_content_as``（被移除的原 ID 列表）
+    —— 引用不静默替换，保留「原始来源不可变」的可追溯声明（[0440] 实施建议 2）。
+
     Returns:
         {file, section_id, procedure_id, id} 的引用 dict；字段缺失时为空串。
     """
     raw_src = action.get("source")
     src = raw_src if isinstance(raw_src, dict) else {}
+    rep = rep_of or {}
+    section_id = src.get("section_id") or action.get("section_id") or ""
+    original_section_id = section_id
+    if section_id and section_id in rep:
+        section_id = rep[section_id]
     ref = {
         "file": (
             src.get("file")
@@ -212,7 +231,7 @@ def _resolve_source(action: dict, *, kind: str = "action") -> dict:
             or action.get("file")
             or ""
         ),
-        "section_id": src.get("section_id") or action.get("section_id") or "",
+        "section_id": section_id,
         "procedure_id": (
             src.get("procedure_id")
             or action.get("procedure_id")
@@ -220,18 +239,23 @@ def _resolve_source(action: dict, *, kind: str = "action") -> dict:
         ),
         "id": action.get("id") or action.get("action_id") or "",
     }
-    # 归一化 None -> ""
-    return {k: (v if v is not None else "") for k, v in ref.items()}
+    ref = {k: (v if v is not None else "") for k, v in ref.items()}
+    if original_section_id and original_section_id in rep:
+        ref["same_content_as"] = [original_section_id]
+    return ref
 
 
-def _extract_steps(action: dict) -> list[dict]:
+def _extract_steps(
+    action: dict, rep_of: Optional[dict[str, str]] = None
+) -> list[dict]:
     """从动作富字段里提取操作步骤（P2-2 逐条带来源引用）。
 
     优先读富字段的 procedure（ActionStep 字典序）；无 procedure 时尝试
     从裸 action/action_id 兜底为单步。每个 step 附带 `source` 引用
     （file/section_id/procedure_id/action_id），可追溯到 artifacts。
+    ``rep_of`` 透传给 ``_resolve_source``（内容级去重代表归一，[0512]）。
     """
-    source = _resolve_source(action)
+    source = _resolve_source(action, rep_of=rep_of)
     steps: list[dict] = []
     for s in action.get("procedure") or []:
         if isinstance(s, dict):
@@ -256,7 +280,9 @@ def _extract_steps(action: dict) -> list[dict]:
     return steps
 
 
-def _extract_warnings(action: dict) -> tuple[list[str], list[dict]]:
+def _extract_warnings(
+    action: dict, rep_of: Optional[dict[str, str]] = None
+) -> tuple[list[str], list[dict]]:
     """从动作富字段 + 步骤说明里收集注意事项（P2-2 逐条带来源）。
 
     读 action 的 recovery（恢复/回滚说明）与 risk 提示，并补充
@@ -264,9 +290,9 @@ def _extract_warnings(action: dict) -> tuple[list[str], list[dict]]:
 
     Returns:
         (warnings, sources)：warnings 为纯文本列表；sources 与之一一对应，
-        每条为 _resolve_source 来源引用。
+        每条为 _resolve_source 来源引用（``rep_of`` 透传，[0512]）。
     """
-    source = _resolve_source(action)
+    source = _resolve_source(action, rep_of=rep_of)
     warnings: list[str] = []
     sources: list[dict] = []
     seen: set[str] = set()
@@ -293,12 +319,15 @@ def _extract_warnings(action: dict) -> tuple[list[str], list[dict]]:
     return warnings, sources
 
 
-def _extract_assertions(action: dict) -> list[dict]:
+def _extract_assertions(
+    action: dict, rep_of: Optional[dict[str, str]] = None
+) -> list[dict]:
     """从动作的成功准则（success_criteria）提取断言（P2-2）。
 
     每条断言含 text 与 source 引用，作为答案的可验证断言，逐条可溯源。
+    ``rep_of`` 透传给 ``_resolve_source``（内容级去重代表归一，[0512]）。
     """
-    source = _resolve_source(action)
+    source = _resolve_source(action, rep_of=rep_of)
     assertions: list[dict] = []
     seen: set[str] = set()
     for sc in action.get("success_criteria") or []:
@@ -313,33 +342,50 @@ def _extract_preconditions(action: dict) -> list[str]:
     return [p for p in (action.get("preconditions") or []) if isinstance(p, str) and p.strip()]
 
 
-def _extract_citations(context: dict) -> list[dict]:
-    """收集溯源引用（action/procedure/section id + title + score）。"""
-    citations: list[dict] = []
-    seen: set[str] = set()
+def _extract_citations(
+    context: dict, rep_of: Optional[dict[str, str]] = None
+) -> list[dict]:
+    """收集溯源引用（action/procedure/section id + title + score）。
 
-    def _add(cite_id: str, title: str, kind: str, score: float) -> None:
-        if not cite_id or cite_id in seen:
-            return
-        seen.add(cite_id)
-        citations.append({
-            "kind": kind,
-            "id": cite_id,
-            "title": title or "",
-            "score": round(float(score or 0.0), 3),
-        })
-
+    ``rep_of`` 提供时，命中记录的 ``id`` 归一为其内容级去重代表（[0512]），
+    并附加 ``same_content_as``（被移除的同内容组成员 ID，代表与孪生同时
+    命中时聚合全部成员）——引用指向可定位的代表，同时保留原 ID 可追溯，
+    不静默替换（[0440] 建议二）。
+    """
+    rep = rep_of or {}
+    raw: list[tuple[str, str, str, float]] = []  # (原 id, title, kind, score)
     for a in context.get("actions") or []:
-        _add(
+        raw.append((
             a.get("id") or a.get("action_id", ""),
             a.get("title", ""),
             "action",
             a.get("score", 0.0),
-        )
+        ))
     for p in context.get("procedures") or []:
-        _add(p.get("id", ""), p.get("title", ""), "procedure", p.get("score", 0.0))
+        raw.append((p.get("id", ""), p.get("title", ""), "procedure", p.get("score", 0.0)))
     for s in context.get("sections") or []:
-        _add(s.get("id", ""), s.get("title", ""), "section", s.get("score", 0.0))
+        raw.append((s.get("id", ""), s.get("title", ""), "section", s.get("score", 0.0)))
+
+    citations: list[dict] = []
+    seen: dict[str, dict] = {}
+    for cite_id, title, kind, score in raw:
+        if not cite_id:
+            continue
+        rep_id = rep.get(cite_id, cite_id)
+        cite = seen.get(rep_id)
+        if cite is None:
+            cite = {
+                "kind": kind,
+                "id": rep_id,
+                "title": title or "",
+                "score": round(float(score or 0.0), 3),
+            }
+            if rep_id != cite_id:
+                cite["same_content_as"] = [cite_id]
+            seen[rep_id] = cite
+            citations.append(cite)
+        elif cite_id != rep_id:
+            cite.setdefault("same_content_as", []).append(cite_id)
     return citations
 
 
@@ -850,7 +896,7 @@ def _collect_injection_flags(ctx: dict) -> list[dict]:
                 continue
             blob = " ".join(
                 str(item.get(f) or "")
-                for f in ("title", "snippet", "text", "content")
+                for f in ("title", "_rerank_text", "snippet", "text", "content")
             )
             for st in item.get("procedure") or []:
                 if isinstance(st, dict):
@@ -871,6 +917,7 @@ def synthesize_answer(
     llm: Optional[Callable[[str, str], str]] = None,
     min_confidence: Optional[float] = None,
     sanitize: bool = True,
+    rep_of: Optional[dict[str, str]] = None,
 ) -> SynthesizedAnswer:
     """输入检索上下文，输出结构化答案（P2-1）。
 
@@ -880,13 +927,20 @@ def synthesize_answer(
             list[dict]（见模块 docstring）。
         llm: 可选的可调用对象 `(user_request, context_text) -> str`，
             用于生成自然语言 answer。为 None 时回落为组装模式（保证
-            无 LLM 时主链路可用）。调用异常会被捕获并回落到组装模式。
+            无 LLM 时主链路可用）。调用异常会被捕获并回落到组装模式；
+            LLMInsufficientEvidenceError 除外——它表示模型判定证据不足，
+            捕获后置 answer_status='refused'（不回落编造步骤）。
         min_confidence: 证据不足拒答的置信度阈值（P2-3）。为 None 时使用
             模块默认 CONFIDENCE_REFUSE_THRESHOLD。低于该阈值或证据不足
             时明确拒答（answer_status='refused'），不编造。
         sanitize: (P3-3) 为 True（默认）时，喂给 LLM 的检索上下文先做
             注入清洗并包裹在「不可信数据围栏」中（system prompt 隔离），
             降低恶意文档 prompt injection 风险。组装模式（无 llm）不受影响。
+        rep_of: 内容级去重的 id→代表 映射（``JsonlCorpus._rep_of``，[0512]）。
+            提供时，来源引用与 citations 中指向被移除 ID 的 section_id/id
+            归一为其组代表并附 ``same_content_as`` 声明，保证引用可定位
+            （设计 §9）且不静默替换（[0440] 实施建议 2）。None 时不归一
+            （兼容无映射的调用方）。
 
     Returns:
         SynthesizedAnswer（结构化结果）。
@@ -903,11 +957,11 @@ def synthesize_answer(
     assertions: list[dict] = []
     preconditions: list[str] = []
     for a in actions:
-        steps.extend(_extract_steps(a))
-        a_warnings, a_sources = _extract_warnings(a)
+        steps.extend(_extract_steps(a, rep_of=rep_of))
+        a_warnings, a_sources = _extract_warnings(a, rep_of=rep_of)
         warnings.extend(a_warnings)
         warning_sources.extend(a_sources)
-        assertions.extend(_extract_assertions(a))
+        assertions.extend(_extract_assertions(a, rep_of=rep_of))
         preconditions.extend(_extract_preconditions(a))
     # 去重（按内容）；warnings 与 warning_sources 同步去重，保证一一对应
     unique_steps: list[dict] = []
@@ -947,7 +1001,7 @@ def synthesize_answer(
         )
     injection_flags = _collect_injection_flags(ctx) if sanitize else []
 
-    citations = _extract_citations(ctx)
+    citations = _extract_citations(ctx, rep_of=rep_of)
     confidence = _compute_confidence(ctx)
     extraction_confidence = round(_extraction_confidence(ctx) or 0.0, 3)
     requires_confirmation = _compute_requires_confirmation(ctx)
@@ -977,6 +1031,7 @@ def synthesize_answer(
 
             _items = list(primary) + [s for s in steps if isinstance(s, dict)]
             context_text = render_isolated_context(_items, user_request)
+            context_text = _clip_context_budget(context_text)
         else:
             context_text = _render_context_text(
                 user_request, primary, steps, uniq_warnings, uniq_pre
@@ -986,6 +1041,14 @@ def synthesize_answer(
             if generated and generated.strip():
                 answer = generated.strip()
                 generated_by = LLM_MODE
+        except LLMInsufficientEvidenceError:
+            # 模型判定证据不足：明确拒答，与确定性拒答共用同一状态口径，
+            # 不允许回落组装路径按 answered 输出编造步骤。
+            if answer_status == ANSWER_ANSWERED:
+                answer_status = ANSWER_REFUSED
+                refusal_reason = "insufficient_evidence_llm"
+                conflicts = []
+                requires_confirmation = True
         except Exception:  # LLM 失败不阻塞主链路，回落到组装
             answer = ""
 
@@ -1018,6 +1081,47 @@ def synthesize_answer(
         conflicts=conflicts,
         injection_flags=injection_flags,
     )
+
+
+#: LLM 上下文总字符预算。0（默认）不截断——远程大窗口端点零影响。
+#: 小窗口本地模型（如 4K ctx 的 2B）经环境变量收紧：全文证据超过
+#: 窗口时 prompt 吃满整个上下文，补全为空（finish_reason=length），
+#: 全部回落组装，拒答链路失效。按 [源N] 段落边界从尾部丢弃，保留
+#: 排名靠前的来源完整正文。
+def _llm_context_budget() -> int:
+    import os
+
+    raw = os.environ.get("EDR_RAG_LLM_CONTEXT_BUDGET", "").strip()
+    if not raw:
+        return 0
+    try:
+        return max(int(raw), 0)
+    except ValueError:
+        return 0
+
+
+def _clip_context_budget(context_text: str) -> str:
+    """把围栏上下文裁剪到预算内：丢弃尾部的整段 [源N]，保住头部来源。
+
+    预算 0 表示不限制。行结构（用户请求/围栏标记/声明）全部保留，
+    只按 ``[源N] `` 前缀识别来源段并从最后一段往前丢，避免把某条
+    来源截成半句。
+    """
+    budget = _llm_context_budget()
+    if budget <= 0 or len(context_text) <= budget:
+        return context_text
+    lines = context_text.split("\n")
+    src_idx = [i for i, ln in enumerate(lines) if ln.startswith("[源")]
+    if not src_idx:
+        return context_text[:budget] + "…[已截断]"
+    head_end = src_idx[0]
+    keep_lines = lines[:head_end]
+    for i in src_idx:
+        if sum(len(x) + 1 for x in keep_lines) + len(lines[i]) + 1 > budget:
+            break
+        keep_lines.append(lines[i])
+    keep_lines.extend(lines[src_idx[-1] + 1:])
+    return "\n".join(keep_lines)
 
 
 def _render_context_text(
@@ -1109,5 +1213,12 @@ def answer_to_text(answer: SynthesizedAnswer) -> str:
         out.append("")
         out.append("引用来源：")
         for c in answer.citations:
-            out.append(f"  [{c['kind']}] {c.get('id', '')} — {c.get('title', '')} (score={c.get('score', 0)})")
+            # 内容级去重声明（[0512]）：引用指向代表 ID 时附同内容
+            # 组成员，保持「原始来源不可变」可追溯。
+            twins = c.get("same_content_as") or []
+            twin_note = f"（同内容：{'、'.join(twins)}）" if twins else ""
+            out.append(
+                f"  [{c['kind']}] {c.get('id', '')}{twin_note}"
+                f" — {c.get('title', '')} (score={c.get('score', 0)})"
+            )
     return "\n".join(out)

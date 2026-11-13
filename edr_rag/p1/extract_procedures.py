@@ -75,6 +75,14 @@ _STEP_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Floating figure/table captions ("图1 快速查杀", "表2 参数说明") that P0
+# flattening glues onto the tail of step sentences. Only matches after a
+# sentence-final punctuation, so mid-sentence references like "如 图2 所示"
+# are preserved. Verified on both manuals: 0 genuine instructions start with
+# 图N/表N after sentence-final punctuation, and no step becomes empty after
+# truncation.
+_FLOATING_CAPTION_RE = re.compile(r"(?<=[。！？：;；])\s*[图表]\d+[ 　]")
+
 # Line that looks like a standalone content line (has >=2 CJK chars or word)
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 
@@ -134,6 +142,18 @@ def _extract_target(text: str, verb: str) -> str:
     return rest[:end].strip()
 
 
+def _strip_floating_caption(text: str) -> str:
+    """Drop a floating figure/table caption glued to a step's tail.
+
+    P0 flattening splices "图N 标题" / "表N 标题" (and everything after
+    them — table bodies, 后续处理 blocks) directly after step sentences.
+    Anything from the first floating caption onward is caption+captioned
+    content, not instruction text.
+    """
+    m = _FLOATING_CAPTION_RE.search(text)
+    return text[: m.start()].rstrip(" 　") if m else text
+
+
 def _split_content_blocks(
     content: str,
 ) -> tuple[list[str], list[str], list[str], list[str], list[str]]:
@@ -161,20 +181,22 @@ def _split_content_blocks(
     current_block: Optional[list] = None
 
     # Also handle the flattened case: walk sentence-like fragments.
-    # If the whole content is one line but contains "N. " step markers,
-    # split it into fragments on those markers so the loop sees them.
-    # Use an UNANCHORED search here — the flattened content is a single
-    # line with steps inline, so "^N." won't match mid-string.
+    # P0 _clean_text flattens sections into space-joined lines; numbered
+    # steps end up inline mid-line (often after boilerplate like
+    # "html PUBLIC ..."), so per-line "^N." never matches. Split any line
+    # containing >=2 "N. " markers on those boundaries so the loop sees
+    # step-anchored fragments.
     _INLINE_STEP = re.compile(r"\d+[.、)．]\s")
-    if len(lines) == 1 and _INLINE_STEP.search(lines[0]):
-        # Rebuild as pseudo-lines split on step boundaries
-        pseudo_lines: list[str] = []
-        frags = re.split(r"(?=\d+[.、)．]\s)", lines[0])
-        for fr in frags:
-            fr = fr.strip()
-            if fr:
-                pseudo_lines.append(fr)
-        lines = pseudo_lines
+    rebuilt: list[str] = []
+    for ln in lines:
+        if len(_INLINE_STEP.findall(ln)) >= 2:
+            for fr in re.split(r"(?=\d+[.、)．]\s)", ln):
+                fr = fr.strip()
+                if fr:
+                    rebuilt.append(fr)
+        else:
+            rebuilt.append(ln)
+    lines = rebuilt
 
     for ln in lines:
         # Detect numbered-step lines
@@ -185,7 +207,7 @@ def _split_content_blocks(
             current_block = steps
             step_text = _STEP_RE.sub("", ln).strip(" :：.-—–")
             if step_text and len(step_text) >= 2:
-                steps.append(step_text)
+                steps.append(_strip_floating_caption(step_text))
             continue
 
         # Detect warning/important/note heading lines
@@ -386,11 +408,22 @@ def _split_sentences(content: str) -> list[str]:
 
 
 def _looks_like_step_sentence(s: str) -> bool:
-    """Heuristic: a sentence is a step if it starts with an action verb."""
+    """Heuristic: a sentence is a step if it starts with an action verb.
+
+    Guards against table/parameter-definition sentences that merely *contain*
+    an action verb in the leading noun compound (e.g. "启动类型 立即启动：…"
+    — the table row label "启动类型" is a noun, not an instruction to click).
+    A genuine instruction puts the verb at the head followed by an object,
+    not "verb + 类型/模式/策略" + "：" + enumeration.
+    """
     for v in ("点击", "选择", "输入", "打开", "关闭", "确认", "保存",
               "导出", "导入", "启用", "禁用", "添加", "删除", "设置",
               "配置", "新建", "启动", "停止", "重启", "进入", "勾选"):
         if s.startswith(v):
+            rest = s[len(v):]
+            # "启动类型..." / "扫描模式..." — a noun parameter label
+            if rest.startswith(("类型", "模式", "策略", "项", "方式")):
+                continue
             return True
     return False
 
@@ -573,8 +606,15 @@ def extract_procedures_from_file(
     """Run P1 extraction over a sections.jsonl file.
 
     Returns (procedures, chunks). Does NOT write any files.
+
+    If a section id carries the ingest disambiguation suffix (@<fileslug>),
+    the procedure id gets the same suffix so chunk/node derivation cascades:
+    same derived procedure id from different source sections must not share
+    one identity (root-cause fix companion to edr_rag.id_disambiguation).
     """
     import json
+
+    from ..id_disambiguation import disambiguate_procedure_ids
 
     procedures: list[Procedure] = []
     chunks: list[RetrievalChunk] = []
@@ -585,8 +625,36 @@ def extract_procedures_from_file(
                 continue
             section = json.loads(line)
             procs = extract_procedures_from_section(section, product=product)
+            for proc in procs:
+                sid = section.get("id", "")
+                if "@" in sid and "@" not in proc.id:
+                    proc.id = f"{proc.id}@{sid.rsplit('@', 1)[1]}"
             procedures.extend(procs)
             chunks.extend(build_chunks(section, procs))
+
+    # Layer-2 collision: distinct section ids can slug-collapse into one derived
+    # procedure id (e.g. "登录 业务面" space vs "登录_业务面" underscore). Same
+    # rule as section disambiguation: diff-(section_id, body) groups all get
+    # @<fileslug>; equivalent groups keep the id for read-side dedupe.
+    proc_dicts = disambiguate_procedure_ids([p.to_jsonl() for p in procedures])
+    if any(d["id"] != p.id for d, p in zip(proc_dicts, procedures)):
+        renames = {
+            (p.source.section_id, p.source.file): (p.id, d["id"])
+            for d, p in zip(proc_dicts, procedures) if d["id"] != p.id
+        }
+        for p, d in zip(procedures, proc_dicts):
+            p.id = d["id"]
+        for chunk in chunks:
+            key = (chunk.source.section_id, chunk.source.file)
+            if key in renames and chunk.source.procedure_id == renames[key][0]:
+                old_pid, new_pid = renames[key]
+                slug = new_pid.rsplit("@", 1)[1]
+                if chunk.id.rsplit(".s", 1)[-1].isdigit():
+                    head, tail = chunk.id.rsplit(".s", 1)
+                    chunk.id = f"{head}@{slug}.s{tail}"
+                else:
+                    chunk.id = f"{chunk.id}@{slug}"
+                chunk.source.procedure_id = new_pid
 
     return procedures, chunks
 

@@ -42,7 +42,12 @@ def test_optional_embedder_returns_same_object():
 
 
 def test_probe_runs_only_once(monkeypatch):
-    """探测结果被缓存 —— 重复调用不再重新 import / 构造。"""
+    """探测结果被缓存 —— 重复调用不再重新 import / 构造。
+
+    1433 修复后首次调用含真嵌入探针（模型装载的固有 import 链），计数
+    窗口放在预热之后，锁住的是「后续调用零重复装载」这一契约核心。
+    """
+    search_mod._optional_embedder()  # 预热（含探针装载链，计数外）
     calls = {"n": 0}
     real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
 
@@ -54,7 +59,7 @@ def test_probe_runs_only_once(monkeypatch):
     monkeypatch.setattr("builtins.__import__", counting_import)
     for _ in range(5):
         search_mod._optional_embedder()
-    assert calls["n"] <= 1
+    assert calls["n"] == 0
 
 
 def test_repeat_probe_is_cheap():

@@ -27,7 +27,13 @@ import os
 import threading
 from typing import Callable, Optional
 
-from .base import EchoLLMClient, LLMClient, LLMMessage, LLMResponse
+from .base import (
+    EchoLLMClient,
+    LLMClient,
+    LLMInsufficientEvidenceError,
+    LLMMessage,
+    LLMResponse,
+)
 from .openai_compat import OpenAICompatClient
 from .prompt import (
     SYSTEM_PROMPT,
@@ -40,6 +46,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "LLMClient",
+    "LLMInsufficientEvidenceError",
     "LLMMessage",
     "LLMResponse",
     "EchoLLMClient",
@@ -155,9 +162,12 @@ def make_synthesize_callable(
             # 模型没给 JSON —— 当作纯文本 answer 使用（仍比组装路径自然）。
             return resp.text
         if not parsed.get("evidence_sufficient", True):
-            # 模型自己判定证据不足：交回组装路径，由 P2-3 的确定性拒答逻辑
-            # 统一表达，避免两套拒答口径。
-            return ""
+            # 模型自己判定证据不足：抛专用异常，由 ``synthesize_answer``
+            # 捕获后统一置 answer_status='refused'，避免「模型说证据不足、
+            # 组装路径却按 answered 输出编造步骤」的两套拒答口径分裂。
+            raise LLMInsufficientEvidenceError(
+                "model judged evidence insufficient"
+            )
         return parsed.get("answer") or resp.text
 
     return _call

@@ -288,11 +288,23 @@ def render_isolated_context(
 
 
 def _extract_item_text(item: Any) -> str:
-    """从检索结果 dict 抽取可展示文本（title + snippet/content/text 拼接）。"""
+    """从检索结果 dict 抽取可展示文本（title + 正文/snippet 拼接）。
+
+    正文优先取 ``_rerank_text``（检索链路 include_full_text=True 时回填的
+    1200 字完整正文）：120 字 snippet 截断在操作步骤之前，LLM 只看 snippet
+    会把「证据充分」误判为「证据不足」。无该字段时回落 snippet/content/text，
+    与既有行为逐字节一致。
+    """
     if not isinstance(item, dict):
         return str(item) if item is not None else ""
     title = item.get("title") or item.get("action_id") or item.get("id") or ""
-    snippet = item.get("snippet") or item.get("content") or item.get("text") or ""
+    snippet = (
+        item.get("_rerank_text")
+        or item.get("snippet")
+        or item.get("content")
+        or item.get("text")
+        or ""
+    )
     parts = [p for p in (str(title), str(snippet)) if p]
     return " | ".join(parts)
 

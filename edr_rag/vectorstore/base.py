@@ -19,9 +19,12 @@
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional
+
+logger = logging.getLogger(__name__)
 
 #: 默认值常数，供各实现复用。
 DEFAULT_DIM = 512
@@ -169,6 +172,71 @@ class VectorIndex:
         self.embed = embed
         self.dim = dim
         self._indexed_sig: Optional[str] = None  # 内容签名，防重复索引
+        self._embed_sig = _embedder_sig(embed)
+        self._dirty = False  # 上次 persist 后是否有新写入
+        self._restore_sig_from_store()
+
+    def _restore_sig_from_store(self) -> None:
+        """从支持持久化签名的 store 恢复签名 (P4 缺陷修复)。
+
+        PersistentVectorStore.load() 已把上次落盘的 content_sig 载入内存；
+        VectorIndex 新建时（典型场景：新进程 autoload）据此恢复短路状态，
+        避免磁盘向量完整却全量重嵌入。
+
+        磁盘签名格式为 ``content``（模型标识另存于 embedder_sig 字段）；
+        恢复时必须校验磁盘记录的模型指纹与当前 embedder 一致——旧实现把
+        当前 embedder 标识拼接到磁盘上旧 content 上，换模型后跨进程重启
+        拼接结果必然"匹配"，静默服务旧模型向量（1433 审核确认契约漏洞）。
+        指纹缺失（旧格式索引）或不一致时拒绝恢复，保持未索引状态，
+        由 index_records 全量重建并写回双签名。
+        """
+        getter = getattr(self.store, "get_content_sig", None)
+        if getter is None:
+            return
+        try:
+            stored = getter()
+        except Exception:  # pragma: no cover - 防御性
+            return
+        if not stored:
+            return
+        embedder_getter = getattr(self.store, "get_embedder_sig", None)
+        stored_embedder = None
+        if embedder_getter is not None:
+            try:
+                stored_embedder = embedder_getter()
+            except Exception:  # pragma: no cover - 防御性
+                stored_embedder = None
+        if not stored_embedder or stored_embedder != self._embed_sig:
+            logger.warning(
+                "vector index embedder fingerprint mismatch or missing "
+                "(stored=%r, current=%r); ignoring persisted short-circuit "
+                "state to avoid serving stale-model vectors",
+                stored_embedder, self._embed_sig,
+            )
+            return
+        self._indexed_sig = self._embed_sig + ":" + stored
+
+    def _note_indexed_sig(self, records: list[dict], text_field: str) -> None:
+        """索引成功后记录签名，并回写到持久化 store 供下次进程恢复。
+
+        content 与生成它的嵌入模型标识分开落盘：恢复时二者都需匹配
+        当前语料与 embedder 才允许短路，见 ``_restore_sig_from_store``。
+        """
+        self._dirty = True
+        content = _content_sig(records, text_field)
+        self._indexed_sig = self._embed_sig + ":" + content
+        setter = getattr(self.store, "set_content_sig", None)
+        if setter is not None:
+            try:
+                setter(content)
+            except Exception:  # pragma: no cover - best-effort
+                pass
+        embedder_setter = getattr(self.store, "set_embedder_sig", None)
+        if embedder_setter is not None:
+            try:
+                embedder_setter(self._embed_sig)
+            except Exception:  # pragma: no cover - best-effort
+                pass
 
     def index_records(
         self,
@@ -188,12 +256,12 @@ class VectorIndex:
         Returns:
             实际写入条数。
         """
-        sig = _content_sig(records, text_field)
+        sig = self._embed_sig + ":" + _content_sig(records, text_field)
         if not force and self._indexed_sig == sig:
             return self.count()
         self.store.delete(_all_ids(self.store))
         n = self._embed_upsert(records, text_field, id_field)
-        self._indexed_sig = sig
+        self._note_indexed_sig(records, text_field)
         return n
 
     def _embed_upsert(
@@ -214,6 +282,10 @@ class VectorIndex:
                 重嵌入子集时必须显式传入原始位置 (P3-5)。
         """
         vector_records = []
+        # 单批内同 ID 检测：PersistentVectorStore.upsert 按 ID 覆盖，静默
+        # 后写覆盖 = 数据丢失（1433 审核漏洞 #2）。批内消歧为唯一存储键，
+        # 原始 id 保留在 metadata（检索经 doc_idx 回记录，后缀不外泄）。
+        seen_ids: dict[str, int] = {}
         for i, r in enumerate(records):
             text = r.get(text_field) or r.get("text") or r.get("content") or ""
             if not text.strip():
@@ -222,6 +294,9 @@ class VectorIndex:
             if not vec:
                 continue
             rec_id = str(r.get(id_field) or f"rec_{i}")
+            n = seen_ids.get(rec_id, 0) + 1
+            seen_ids[rec_id] = n
+            store_id = rec_id if n == 1 else f"{rec_id}#dup{n}"
             real_idx = doc_indices[i] if doc_indices is not None else i
             meta: dict[str, Any] = {"doc_idx": real_idx, "id": rec_id}
             meta.update(r.get("metadata") or {})
@@ -234,7 +309,7 @@ class VectorIndex:
                     meta[attr] = val
             vector_records.append(
                 VectorRecord(
-                    id=rec_id,
+                    id=store_id,
                     vector=list(vec),
                     metadata=meta,
                     text=text,
@@ -275,19 +350,27 @@ class VectorIndex:
         added: list[str] = []
         updated: list[str] = []
         unchanged: list[str] = []
+        # 同批内同 ID 消歧（与 _embed_upsert 同一方案）：重复 ID 是实质
+        # 不同的变体，共享键会让 by_id/orig_index/new_known 收敛到最后一
+        # 变体——前位变体变化时以错误文本在错误位置重嵌入（1433 审核漏洞
+        # #2 的增量形状）。批内第 2..n 次出现的 ID 记为 <id>#dupN。
+        seen_ids: dict[str, int] = {}
 
         for i, r in enumerate(records):
             rec_id = str(r.get(id_field) or f"rec_{i}")
+            n = seen_ids.get(rec_id, 0) + 1
+            seen_ids[rec_id] = n
+            key = rec_id if n == 1 else f"{rec_id}#dup{n}"
             fp = _record_fingerprint(r, text_field)
-            new_known[rec_id] = fp
-            by_id[rec_id] = r
-            orig_index[rec_id] = i
-            if rec_id not in known:
-                added.append(rec_id)
-            elif known[rec_id] != fp:
-                updated.append(rec_id)
+            new_known[key] = fp
+            by_id[key] = r
+            orig_index[key] = i
+            if key not in known:
+                added.append(key)
+            elif known[key] != fp:
+                updated.append(key)
             else:
-                unchanged.append(rec_id)
+                unchanged.append(key)
 
         removed = [rid for rid in known if rid not in new_known]
 
@@ -304,7 +387,7 @@ class VectorIndex:
 
         # 让 index_records 的整批签名短路与新状态一致，避免紧随其后的
         # 全量重建被误触发。
-        self._indexed_sig = _content_sig(records, text_field)
+        self._note_indexed_sig(records, text_field)
 
         return (
             IncrementalIndexResult(
@@ -343,13 +426,19 @@ class VectorIndex:
         """把底层存储落盘 (P4)。存储不支持持久化时返回 False，不抛异常。
 
         由调用方在**实际发生写入之后**调用；``index_records`` 的内容签名短路
-        命中时不应调用，以免每次查询都产生无谓 IO。
+        命中时磁盘已是最新，本方法直接返回 True 不重写存储，避免每次查询
+        都产生无谓 IO。
         """
         save = getattr(self.store, "save", None)
         if save is None:
             return False
+        if not self._dirty:
+            return True
         try:
-            return bool(save())
+            saved = bool(save())
+            if saved:
+                self._dirty = False
+            return saved
         except Exception:  # pragma: no cover - best-effort 持久化
             import logging
 
@@ -365,6 +454,20 @@ def _all_ids(store: VectorStore) -> list[str]:
         return store.ids()
     except (AttributeError, NotImplementedError):
         return []
+
+
+def _embedder_sig(embed: Callable[[str], list[float]]) -> str:
+    """嵌入函数的稳定标识，并入内容签名。
+
+    同一批文本换嵌入模型后向量空间不同，签名必须跟着变，否则持久化
+    短路会静默服务陈旧向量。优先读 ``model_id`` 属性 (真实 embedder
+    构造时由 p1.search 附加模型名)；测试/自定义函数回退到
+    ``module.qualname`` —— 同一进程内同一函数对象标识稳定。
+    """
+    model_id = getattr(embed, "model_id", None)
+    if model_id:
+        return str(model_id)
+    return f"{getattr(embed, '__module__', '?')}.{getattr(embed, '__qualname__', '?')}"
 
 
 def _content_sig(records: list[dict], text_field: str) -> str:

@@ -259,7 +259,8 @@ class EdrRagAPI:
 
         if context is None:
             context = self._service.planner_retrieve(
-                user_request, limit=limit, strategy=strategy, acl=acl
+                user_request, limit=limit, strategy=strategy, acl=acl,
+                include_full_text=True,
             )
         # 检索返回的动作结果是薄形状（无 procedure/preconditions/recovery），
         # 用全量动作记录补全，让合成器能输出完整步骤/前置条件/注意事项。
@@ -268,12 +269,16 @@ class EdrRagAPI:
         # 未配置则 llm 保持 None，走 P2 的确定性组装路径。
         if llm is None:
             llm = _configured_llm_callable()
+        # [0512] 内容级去重映射：引用渲染归一到代表 ID + same_content_as
+        # 声明（[0440] 实施建议 2），与 eval 链路共用同一份映射。
+        rep_of = self._service.representative_map("sections")
         return synthesize_answer(
             user_request,
             context,
             llm=llm,
             min_confidence=min_confidence,
             sanitize=sanitize,
+            rep_of=rep_of,
         ).to_jsonl()
 
 

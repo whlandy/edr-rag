@@ -67,6 +67,10 @@ class EvalQuery:
     # P2-6: 生成 (generation) 维度标注（可选，None 表示不参与该维度）。
     expected_refusal: Optional[bool] = None
     high_risk: Optional[bool] = None
+    # 事实组标注（可选）：每组 = 承载同一事实的等价来源 id 集合（如消歧后
+    # 的内容孪生变体），命中任一成员覆盖该事实；组间独立。提供时 runner
+    # 额外计算 fact_recall@k / fact_mrr，普通文档级指标不变。
+    fact_groups: list[list[str]] = field(default_factory=list)
 
     @staticmethod
     def from_dict(d: dict) -> "EvalQuery":
@@ -82,6 +86,7 @@ class EvalQuery:
             filter_expected=list(d.get("filter_expected", []) or []),
             expected_refusal=_opt_bool(d.get("expected_refusal")),
             high_risk=_opt_bool(d.get("high_risk")),
+            fact_groups=[list(g) for g in (d.get("fact_groups") or []) if g],
         )
 
     def effective_queries(self, use_paraphrases: bool = False) -> list[tuple[str, str]]:

@@ -228,6 +228,82 @@ def test_vector_index_persist_is_noop_for_memory_store():
     assert index.persist() is False
 
 
+def test_persistent_content_sig_survives_restart(tmp_path):
+    """content_sig 随 meta 落盘并在新实例恢复 (P4 冷载缺陷)。"""
+    store = PersistentVectorStore(directory=tmp_path, namespace="chunks")
+    index = VectorIndex(store, _embed)
+    index.index_records(
+        [{"_doc_id": "r1", "_searchable": "配置代理"}],
+        text_field="_searchable",
+        id_field="_doc_id",
+    )
+    index.persist()
+    assert store.get_content_sig() is not None
+
+    reopened = PersistentVectorStore(directory=tmp_path, namespace="chunks")
+    assert reopened.get_content_sig() == store.get_content_sig()
+
+
+def test_vector_index_new_process_short_circuits_no_reembed(tmp_path):
+    """新进程 VectorIndex 借持久化签名短路，不全量重嵌入 (P4 冷载缺陷)。"""
+    records = [
+        {"_doc_id": "r1", "_searchable": "配置代理服务器"},
+        {"_doc_id": "r2", "_searchable": "配置邮件告警"},
+    ]
+    store1 = PersistentVectorStore(directory=tmp_path, namespace="chunks")
+    index1 = VectorIndex(store1, _embed)
+    assert index1.index_records(records, text_field="_searchable", id_field="_doc_id") == 2
+    index1.persist()
+
+    # 新实例 (模拟新进程 autoload)：同语料短路，不重嵌入
+    store2 = PersistentVectorStore(directory=tmp_path, namespace="chunks")
+    index2 = VectorIndex(store2, _embed)
+    assert index2.index_records(records, text_field="_searchable", id_field="_doc_id") == 2
+    assert store2.count() == 2
+
+
+def test_vector_index_embedder_change_invalidates_persisted_sig(tmp_path):
+    """换嵌入模型 (model_id 变化) 后持久化签名失效，强制重建。"""
+    def _embed_v2(text: str) -> list[float]:
+        seed = sum(ord(c) for c in text)
+        return [float(seed % 13) / 13.0, float(seed % 3) / 3.0, 1.0]
+
+    records = [{"_doc_id": "r1", "_searchable": "配置代理服务器"}]
+    store1 = PersistentVectorStore(directory=tmp_path, namespace="chunks")
+    index1 = VectorIndex(store1, _embed)
+    index1.index_records(records, text_field="_searchable", id_field="_doc_id")
+    index1.persist()
+
+    store2 = PersistentVectorStore(directory=tmp_path, namespace="chunks")
+    index2 = VectorIndex(store2, _embed_v2)
+    # 签名含 embedder 标识 -> 不匹配 -> 重建 (会重写而非短路跳过)
+    n = index2.index_records(records, text_field="_searchable", id_field="_doc_id")
+    assert n == 1
+    assert index2._indexed_sig != index1._indexed_sig
+
+
+def test_vector_index_persist_skips_clean_store(tmp_path, monkeypatch):
+    """签名短路后 persist() 不重写磁盘 (守卫 if indexed 恒真的场景)。"""
+    store = PersistentVectorStore(directory=tmp_path, namespace="chunks")
+    index = VectorIndex(store, _embed)
+    records = [{"_doc_id": "r1", "_searchable": "配置代理"}]
+    index.index_records(records, text_field="_searchable", id_field="_doc_id")
+    index.persist()
+
+    calls = {"save": 0}
+    real_save = store.save
+    monkeypatch.setattr(store, "save", lambda: (calls.__setitem__("save", calls["save"] + 1), real_save())[1])
+    # 短路路径：无新写入时 persist 不触发 store.save
+    assert index.persist() is True
+    assert calls["save"] == 0
+    # 真实写入后 persist 落盘并清脏标记
+    index.index_records([{"_doc_id": "r2", "_searchable": "新内容"}], text_field="_searchable", id_field="_doc_id")
+    assert index.persist() is True
+    assert calls["save"] == 1
+    assert index.persist() is True
+    assert calls["save"] == 1
+
+
 def test_vector_index_persist_writes_through(tmp_path):
     store = PersistentVectorStore(directory=tmp_path, namespace="chunks")
     index = VectorIndex(store, _embed)
@@ -297,3 +373,101 @@ def test_get_vector_store_isolates_namespaces(tmp_path):
 def test_vector_dir_for_workdir(tmp_path):
     assert vector_dir_for_workdir(tmp_path).name == "vector_index"
     assert vector_dir_for_workdir(None) is None
+
+
+# ---------- 模型指纹持久化 (1433 审核契约漏洞修复) ----------
+
+
+def test_persistent_meta_stores_embedder_sig(tmp_path):
+    """磁盘 meta 持久化 embedder 标识；新实例可读回。"""
+    store = PersistentVectorStore(directory=tmp_path, namespace="chunks")
+    index = VectorIndex(store, _embed)
+    index.index_records(
+        [{"_doc_id": "r1", "_searchable": "配置代理"}],
+        text_field="_searchable",
+        id_field="_doc_id",
+    )
+    index.persist()
+    assert store.get_embedder_sig() == "edr_rag.tests.test_vectorstore._embed"
+
+    import json
+
+    meta = json.loads((tmp_path / "chunks.meta.json").read_text(encoding="utf-8"))
+    assert meta.get("embedder_sig") == "edr_rag.tests.test_vectorstore._embed"
+
+
+def test_cross_process_embedder_change_cannot_reuse_old_vectors(tmp_path):
+    """换模型后经磁盘恢复（新进程）必须拒绝旧模型向量，强制重建。
+
+    缺陷形状：旧实现 _restore_sig_from_store 用「当前」embedder 拼接磁盘上
+    的旧 content_sig，同进程测试测不到——换模型且跨进程重启时签名必然
+    匹配，静默服务旧模型向量。
+    """
+    def _embed_v2(text: str) -> list[float]:
+        seed = sum(ord(c) for c in text)
+        return [float(seed % 13) / 13.0, float(seed % 3) / 3.0, 1.0]
+
+    records = [{"_doc_id": "r1", "_searchable": "配置代理服务器"}]
+    store1 = PersistentVectorStore(directory=tmp_path, namespace="chunks")
+    index1 = VectorIndex(store1, _embed)
+    index1.index_records(records, text_field="_searchable", id_field="_doc_id")
+    index1.persist()
+
+    # 模拟新进程：从磁盘 autoload 恢复，换嵌入模型。
+    store2 = PersistentVectorStore(directory=tmp_path, namespace="chunks")
+    assert store2.get_content_sig() is not None
+    index2 = VectorIndex(store2, _embed_v2)
+    n = index2.index_records(records, text_field="_searchable", id_field="_doc_id")
+    # 旧实现：restore 拼接出的 sig 与新模型 sig 相同 -> 短路返回 count()=1，n=1
+    # 但 store 里仍是旧模型向量。正确行为：不匹配 -> 重建 -> 向量已换。
+    assert n == 1
+    hits = store2.search(_embed_v2("配置代理服务器"), top_k=1)
+    assert hits, "换模型重建后应可用新模型向量命中"
+    assert index2._indexed_sig == index2._embed_sig + ":" + store2.get_content_sig()
+
+
+def test_cross_process_same_embedder_short_circuits(tmp_path):
+    """同模型跨进程恢复仍正常短路，修复不引入回退。"""
+    records = [
+        {"_doc_id": "r1", "_searchable": "配置代理服务器"},
+        {"_doc_id": "r2", "_searchable": "配置邮件告警"},
+    ]
+    store1 = PersistentVectorStore(directory=tmp_path, namespace="chunks")
+    index1 = VectorIndex(store1, _embed)
+    index1.index_records(records, text_field="_searchable", id_field="_doc_id")
+    index1.persist()
+
+    store2 = PersistentVectorStore(directory=tmp_path, namespace="chunks")
+    index2 = VectorIndex(store2, _embed)
+    assert index2.index_records(records, text_field="_searchable", id_field="_doc_id") == 2
+    assert store2.count() == 2
+
+
+def test_legacy_meta_without_embedder_sig_triggers_rebuild(tmp_path):
+    """旧格式 meta（无 embedder_sig 字段）恢复时不得复用为可短路状态。"""
+    import json
+
+    store1 = PersistentVectorStore(directory=tmp_path, namespace="chunks")
+    index1 = VectorIndex(store1, _embed)
+    index1.index_records(
+        [{"_doc_id": "r1", "_searchable": "配置代理"}],
+        text_field="_searchable",
+        id_field="_doc_id",
+    )
+    index1.persist()
+    # 模拟旧版本落盘的 meta：删除 embedder_sig 字段。
+    meta_path = tmp_path / "chunks.meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta.pop("embedder_sig", None)
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+
+    store2 = PersistentVectorStore(directory=tmp_path, namespace="chunks")
+    index2 = VectorIndex(store2, _embed)
+    # 无模型指纹 -> 无法证明向量属于当前模型 -> 必须重建而非短路。
+    n = index2.index_records(
+        [{"_doc_id": "r1", "_searchable": "配置代理"}],
+        text_field="_searchable",
+        id_field="_doc_id",
+    )
+    assert n == 1
+    assert store2.get_embedder_sig() == "edr_rag.tests.test_vectorstore._embed"

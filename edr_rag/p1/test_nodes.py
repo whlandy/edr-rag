@@ -186,6 +186,45 @@ def test_no_sections_returns_empty(tmp_path):
     assert nodes == []
 
 
+DOCTYPE_PREFIX = (
+    'html\n  PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" '
+    '"http://www.w3.org/TR/html4/loose.dtd"'
+)
+
+
+def test_build_strips_doctype_leak(tmp_path):
+    """缺陷④（构建期）：磁盘冻结 sections.jsonl 仍含泄漏（读取侧防御只覆盖
+    运行时），从它重建 nodes 会复现泄漏进 text/metadata.recovery——构建期
+    须同口径剥离，使重建产物在磁盘上即干净。"""
+    workdir = tmp_path / "w4"
+    workdir.mkdir()
+    sec = dict(SECTION)
+    sec["content"] = f"{DOCTYPE_PREFIX} {SECTION['content']}"
+    sec["metadata"] = {
+        "recovery": [f"{DOCTYPE_PREFIX} 连接失败请检查端口 22"],
+    }
+    proc = json.loads(json.dumps(PROCEDURE, ensure_ascii=False))
+    proc["recovery"] = [f"{DOCTYPE_PREFIX} 恢复说明"]
+    with (workdir / "sections.jsonl").open("w", encoding="utf-8") as f:
+        f.write(json.dumps(sec, ensure_ascii=False) + "\n")
+    with (workdir / "procedures.jsonl").open("w", encoding="utf-8") as f:
+        f.write(json.dumps(proc, ensure_ascii=False) + "\n")
+
+    nodes, nodes_path = build_structured_nodes_file(workdir)
+    # 磁盘产物（非仅内存视图）逐行扫描无泄漏
+    raw = nodes_path.read_text(encoding="utf-8")
+    assert "loose.dtd" not in raw
+    by_level = {n.level: n for n in nodes}
+    assert by_level["section"].text.startswith("本文介绍")
+    # 节点 metadata.recovery（拷贝自 procedure/section）同样干净
+    recovs = [
+        r
+        for n in nodes
+        for r in (n.metadata.get("recovery") or [])
+    ]
+    assert recovs and all("loose.dtd" not in str(r) for r in recovs)
+
+
 def test_to_json_roundtrip():
     """StructuredNode JSON 序列化往返无损。"""
     n = StructuredNode(

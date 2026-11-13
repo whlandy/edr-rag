@@ -365,11 +365,19 @@ def run_ingest(
         parser_version="p0",
     )
 
+    # 4.5 ID collision disambiguation: same id + different semantic content
+    # across topic files must not share one identity (design §5 EvidenceUnit
+    # = source + location). Equivalent-only groups keep the id (read-side
+    # dedupe converges them); diff-content groups all get @<fileslug>.
+    from edr_rag.id_disambiguation import disambiguate_collision_ids
+
+    sections_dicts = disambiguate_collision_ids([s.to_jsonl() for s in sections])
+
     atomic_write_text(
         workdir / "manifest.json",
         json.dumps(manifest.to_json(), ensure_ascii=False, indent=2),
     )
-    write_jsonl(workdir / "sections.jsonl", sections)
+    write_jsonl(workdir / "sections.jsonl", sections_dicts)
     write_jsonl(workdir / "assets.jsonl", assets)
 
     return manifest

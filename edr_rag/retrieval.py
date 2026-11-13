@@ -163,6 +163,18 @@ class RetrievalService:
         self._corpora[corpus_type] = (sig, corpus)
         return corpus
 
+    def representative_map(self, corpus_type: str) -> dict[str, str]:
+        """返回该语料内容级去重的 id→代表 映射（只读副本）。
+
+        供 synthesize 层引用归一与 eval gold 对齐共用（[0440] 结论三 /
+        [0512]：三处消费同一份映射，不各自维护）。corpus 未加载/文件缺失
+        时返回空 dict。
+        """
+        corpus = self._corpus(corpus_type)
+        if corpus is None:
+            return {}
+        return dict(corpus._rep_of)
+
     # ---------- ACL 谓词下推 (P4) ----------
 
     def _acl_fingerprint(self, acl: ACLPolicy) -> tuple:
@@ -245,15 +257,61 @@ class RetrievalService:
 
     # ---------- 搜索 ----------
 
-    def search(self, *args, **kwargs) -> list[dict]:
+    def search(
+        self,
+        *args,
+        include_full_text: bool = False,
+        **kwargs,
+    ) -> list[dict]:
         """统一检索入口（对外）。
 
         这是一层薄包装：真正的检索在 ``_search_impl``，这里只负责在返回前
         剥掉内部字段（以 ``_`` 开头，如 ``_rerank_text``）。内部字段是检索
         链路自己用的（例如喂给 cross-encoder 的完整正文），不该出现在
         API / MCP / CLI 的响应里。
+
+        include_full_text=True 供喂给 LLM 的合成链路使用：``_rerank_text``
+        是 1200 字完整正文，LLM 只看 120 字 snippet 会把「证据充分」误判为
+        「证据不足」（实测阳性对照全误拒）。开启时按 id 回填正文并保留该
+        字段；默认 False 时行为与之前逐字节一致。
         """
-        return _strip_internal_fields(self._search_impl(*args, **kwargs))
+        results = self._search_impl(*args, **kwargs)
+        if include_full_text:
+            corpus_type = (
+                args[1] if len(args) >= 2 else kwargs.get("corpus_type", "actions")
+            )
+            return self._attach_full_text(corpus_type, results)
+        return _strip_internal_fields(results)
+
+    def _attach_full_text(
+        self, corpus_type: str, results: list[dict]
+    ) -> list[dict]:
+        """给检索结果回填 ``_rerank_text``（完整正文字段，供 LLM 上下文）。
+
+        动作富字段与 generic 薄形状都不携带正文，这里按 id 解析回语料原始
+        记录后统一用 ``JsonlCorpus._rerank_text`` 生成（与 rerank 打分用的
+        是同一字段同一规范化，上限 RERANK_TEXT_MAX）。解析不到原始记录的
+        结果原样保留。
+        """
+        corpus = self._corpus(corpus_type)
+        if corpus is None or not results:
+            return results
+        by_id: dict[str, dict] = {}
+        for rec in corpus.records:
+            for key in (rec.get("_doc_id"), rec.get("id"), rec.get("action_id")):
+                if key:
+                    by_id.setdefault(str(key), rec)
+        out: list[dict] = []
+        for r in results:
+            rid = r.get("id") or r.get("action_id")
+            rec = by_id.get(str(rid)) if rid is not None else None
+            if rec is None:
+                out.append(r)
+                continue
+            r2 = dict(r)
+            r2["_rerank_text"] = corpus._rerank_text(rec)
+            out.append(r2)
+        return out
 
     def _search_impl(
         self,
@@ -555,10 +613,24 @@ class RetrievalService:
         )
 
     def _embedder_available(self) -> bool:
-        """embedding 是否可用 (用于决定 hybrid 是否叠加 vector 一路召回)。"""
+        """embedding 是否可用 (用于决定 hybrid 是否叠加 vector 一路召回)。
+
+        1433 修复：`_optional_embedder` 现含真嵌入探针——import 可用但模型
+        加载/推理失败时返回 None，此处随之判 False，与 vector 路实际行为一致。
+        """
         from .p1.search import _optional_embedder
 
         return _optional_embedder() is not None
+
+    @staticmethod
+    def embedder_status() -> str:
+        """嵌入器通道状态 ('active' | 'failed' | 'absent')。
+
+        评测/服务应在输出头部声明，使归档数值自带模式证据。
+        """
+        from .p1.search import embedder_status
+
+        return embedder_status()
 
     def _search_generic_hybrid(
         self,
@@ -580,10 +652,14 @@ class RetrievalService:
         bm = corpus.bm25_search(query, limit=recall_cap, allowed=allowed)
         if bm:
             lists.append(bm)
-        # 有 embedder 时叠加 vector 一路；缺依赖时 vector 会降级成 bm25，
-        # 为避免重复计数同一信号，仅在 embedder 真实可用时纳入。
+        # 有嵌入器时叠加 vector 一路。fallback='empty'：运行中失败返回空，
+        # 绝不把 BM25 结果伪装成向量路重复计入融合（1433 事故：
+        # keyword+BM25+BM25 改变排序且无观测痕迹）。缺依赖/探针失败时
+        # _optional_embedder() 返回 None，vector 路整体不参与。
         if self._embedder_available():
-            vec = corpus.vector_search(query, limit=recall_cap, allowed=allowed)
+            vec = corpus.vector_search(
+                query, limit=recall_cap, allowed=allowed, fallback="empty"
+            )
             if vec:
                 lists.append(vec)
 
@@ -923,6 +999,9 @@ class RetrievalService:
             self._nodes = None
             return []
         nodes = _read_jsonl(path)
+        # 缺陷④b：此路径绕过 JsonlCorpus 防御层（P1-4 上下文补全消费
+        # node.text / metadata.recovery），须同口径剥离 DOCTYPE 泄漏。
+        nodes = JsonlCorpus._strip_doctype_leak(nodes)
         self._nodes = (sig, nodes)
         return nodes
 
@@ -1025,6 +1104,7 @@ class RetrievalService:
         strategy: str = _DEFAULT_STRATEGY,
         rerank: Optional[bool] = None,
         acl: Optional[ACLPolicy] = None,
+        include_full_text: bool = False,
     ) -> dict:
         """完整的 planner 检索流程，保持既有优先级:
 
@@ -1035,6 +1115,7 @@ class RetrievalService:
         传入的 strategy 会被透传给每一层检索，保证 Planner、API、CLI、
         MCP 共享同一套可配置检索策略。`rerank` 同样透传 (P1-3)，详见
         `search`。`acl` (P3-3) 透传给每一层做文档级过滤。
+        `include_full_text` (见 `search`) 透传：合成链路需要完整正文。
 
         Returns:
             dict: {query, actions, [procedures], [sections]}
@@ -1042,6 +1123,7 @@ class RetrievalService:
         actions = self.search(
             user_request, corpus_type="actions", top_k=limit,
             strategy=strategy, rerank=rerank, acl=acl,
+            include_full_text=include_full_text,
         )
         result: dict[str, Any] = {"query": user_request, "actions": actions}
 
@@ -1049,12 +1131,14 @@ class RetrievalService:
             procedures = self.search(
                 user_request, corpus_type="procedures", top_k=limit,
                 strategy=strategy, rerank=rerank, acl=acl,
+                include_full_text=include_full_text,
             )
             result["procedures"] = procedures
             if not procedures:
                 sections = self.search(
                     user_request, corpus_type="sections", top_k=limit,
                     strategy=strategy, rerank=rerank, acl=acl,
+                    include_full_text=include_full_text,
                 )
                 result["sections"] = sections
         else:

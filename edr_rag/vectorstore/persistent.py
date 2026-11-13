@@ -103,6 +103,8 @@ class PersistentVectorStore(VectorStore):
         self._texts: list[str] = []
         self._vectors = array.array(_VEC_TYPECODE)
         self._pos: dict[str, int] = {}      # id -> 行号
+        self._content_sig: Optional[str] = None  # 整批内容签名，供 VectorIndex 短路
+        self._embedder_sig: Optional[str] = None  # 生成这些向量所用嵌入模型的标识
         self._matrix = None                  # numpy 归一化矩阵缓存
         self._matrix_dirty = True
         self._np = _numpy()
@@ -149,6 +151,8 @@ class PersistentVectorStore(VectorStore):
         ids = list(meta.get("ids") or [])
         metadata = list(meta.get("metadata") or [])
         texts = list(meta.get("texts") or [])
+        sig = str(meta.get("content_sig") or "") or None
+        embedder_sig = str(meta.get("embedder_sig") or "") or None
         if dim <= 0 or not ids:
             return False
 
@@ -184,6 +188,8 @@ class PersistentVectorStore(VectorStore):
             self._texts = [str(t) for t in texts[: len(ids)]]
             self._vectors = vectors
             self._pos = {rid: i for i, rid in enumerate(self._ids)}
+            self._content_sig = sig
+            self._embedder_sig = embedder_sig
             self._matrix_dirty = True
         logger.debug(
             "loaded %d vectors (dim=%d) for namespace '%s'",
@@ -199,6 +205,8 @@ class PersistentVectorStore(VectorStore):
         with self._lock:
             if not self._ids:
                 # 空索引：清掉残留文件，避免下次载入到陈旧数据。
+                self._content_sig = None
+                self._embedder_sig = None
                 for p in (vec_path, meta_path):
                     try:
                         p.unlink()
@@ -215,6 +223,12 @@ class PersistentVectorStore(VectorStore):
                 "ids": self._ids,
                 "metadata": self._metadata,
                 "texts": self._texts,
+                # 整批内容签名：VectorIndex 据此在新进程跳过全量重嵌入。
+                # 老索引无此字段时 load 恢复为 None，首次查询仍会重建一次。
+                "content_sig": self._content_sig,
+                # 生成这些向量的嵌入模型标识：VectorIndex 恢复短路状态前
+                # 校验，防止换模型后跨进程复用旧模型向量 (1433 审核契约漏洞)。
+                "embedder_sig": self._embedder_sig,
             }
             vec_bytes = self._vectors.tobytes()
             meta_text = json.dumps(payload, ensure_ascii=False)
@@ -422,6 +436,33 @@ class PersistentVectorStore(VectorStore):
     def ids(self) -> list[str]:
         with self._lock:
             return list(self._ids)
+
+    def get_content_sig(self) -> Optional[str]:
+        """上次落盘的整批内容签名；纯内存或未恢复时为 None。"""
+        with self._lock:
+            return self._content_sig
+
+    def set_content_sig(self, sig: Optional[str]) -> None:
+        """记录当前内容的签名（由 VectorIndex 在成功重建后调用）。
+
+        只改内存，随下一次 ``save()`` 落盘 —— 与向量数据同一原子写，
+        保证签名与向量内容不会出现半更新的错配。
+        """
+        with self._lock:
+            self._content_sig = sig
+
+    def get_embedder_sig(self) -> Optional[str]:
+        """生成当前向量所用的嵌入模型标识；未记录时为 None。"""
+        with self._lock:
+            return self._embedder_sig
+
+    def set_embedder_sig(self, sig: Optional[str]) -> None:
+        """记录生成这些向量的嵌入模型标识（由 VectorIndex 在重建后调用）。
+
+        与 content_sig 同一原子写落盘；None 表示清除（空索引路径）。
+        """
+        with self._lock:
+            self._embedder_sig = sig
 
     def close(self) -> None:
         """落盘并释放矩阵缓存。"""

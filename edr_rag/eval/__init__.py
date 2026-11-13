@@ -4,6 +4,7 @@
 (keyword / bm25 / hybrid) 的质量差异，覆盖:
 
   - Recall@K      召回率
+  - Success@K     完整召回率（top-K 覆盖全部 relevant 的二值指标）
   - MRR           首个命中的倒数排名均值
   - nDCG@K        归一化折损累计增益
   - metadata filter accuracy 过滤器准确率
@@ -22,8 +23,11 @@ from .dataset import EvalSet, EvalQuery, load_eval_set  # noqa: F401
 from .metrics import (  # noqa: F401
     reciprocal_rank,
     recall_at_k,
+    success_at_k,
     ndcg_at_k,
     filter_accuracy,
+    fact_recall_at_k,
+    fact_mrr,
     query_metrics,
     aggregate_metrics,
 )
@@ -43,6 +47,7 @@ __all__ = [
     "load_eval_set",
     "reciprocal_rank",
     "recall_at_k",
+    "success_at_k",
     "ndcg_at_k",
     "filter_accuracy",
     "query_metrics",

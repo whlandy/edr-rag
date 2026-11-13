@@ -529,13 +529,28 @@ def build_structured_nodes_file(
 
     from ..atomic_io import atomic_write_text, write_jsonl as _jsonl_writer
 
-    sections = _read_jsonl(workdir / "sections.jsonl")
+    from ..p1.search import JsonlCorpus
+
+    # 缺陷④（构建期）：磁盘冻结 sections/procedures 仍含 DOCTYPE 泄漏
+    # （读取侧防御只覆盖运行时语料加载），直接构建会把泄漏写进 nodes.jsonl
+    # 的 text/metadata.recovery。构建期同口径剥离，使重建产物磁盘即干净；
+    # 运行时防御层保留（对未重建的旧产物仍生效）。
+    sections = [
+        JsonlCorpus._strip_doctype_leak(r)
+        for r in _read_jsonl(workdir / "sections.jsonl")
+    ]
     if not sections:
         logger.warning("no sections found in %s; nothing to build", workdir)
         return [], nodes_path
 
-    procedures = _read_jsonl(workdir / "procedures.jsonl")
-    actions = _read_jsonl(workdir / "actions.jsonl")
+    procedures = [
+        JsonlCorpus._strip_doctype_leak(r)
+        for r in _read_jsonl(workdir / "procedures.jsonl")
+    ]
+    actions = [
+        JsonlCorpus._strip_doctype_leak(r)
+        for r in _read_jsonl(workdir / "actions.jsonl")
+    ]
 
     nodes = build_structured_nodes(sections, procedures, actions)
 

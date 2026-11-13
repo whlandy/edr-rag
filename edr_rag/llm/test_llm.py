@@ -15,6 +15,7 @@ import pytest
 
 from edr_rag.llm import (
     EchoLLMClient,
+    LLMInsufficientEvidenceError,
     LLMMessage,
     LLMResponse,
     OpenAICompatClient,
@@ -250,14 +251,16 @@ def test_synthesize_callable_discards_truncated_output():
     assert make_synthesize_callable(client)("q", "ctx") == ""
 
 
-def test_synthesize_callable_honours_model_insufficient_evidence():
-    """模型自称证据不足时交回组装路径，避免两套拒答口径。"""
+def test_synthesize_callable_raises_on_model_insufficient_evidence():
+    """模型判定证据不足 -> 抛 LLMInsufficientEvidenceError（缺口1 语义升级：
+    synthesize_answer 捕获后置 refused，不再回落组装编造步骤）。"""
     client = EchoLLMClient()
     payload = json.dumps({"answer": "也许可以...", "evidence_sufficient": False})
     client.complete = lambda messages, max_tokens=1024, temperature=0.0: LLMResponse(
         text=payload, model="fake", finish_reason="stop"
     )
-    assert make_synthesize_callable(client)("q", "ctx") == ""
+    with pytest.raises(LLMInsufficientEvidenceError):
+        make_synthesize_callable(client)("q", "ctx")
 
 
 def test_synthesize_callable_passes_through_plain_text():

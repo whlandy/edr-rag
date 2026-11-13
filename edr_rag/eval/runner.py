@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from ..p2.synthesize import SynthesizedAnswer, synthesize_answer
 from ..retrieval import RetrievalService
@@ -100,7 +100,7 @@ class EvalReport:
 
     def summary(
         self,
-        keys=("recall@k", "mrr", "ndcg@k", "filter_accuracy"),
+        keys=("recall@k", "success@k", "mrr", "ndcg@k", "filter_accuracy"),
         slice_name: str = SLICE_ALL,
     ) -> dict[str, dict[str, float]]:
         """按策略聚合 retrieval 维度指标，返回 {strategy: {metric: mean}}。
@@ -155,6 +155,7 @@ def _run_query(
     service: RetrievalService,
     q: EvalQuery,
     strategy: str,
+    llm: Optional[Callable] = None,
 ) -> QueryResult:
     """对单条查询在单个策略下执行检索并计算指标。
 
@@ -167,12 +168,15 @@ def _run_query(
     一起落在同一个 QueryResult 里。
     """
     top_k = q.top_k
-    # 主检索（无过滤）：用于排序类指标。
+    # 主检索（无过滤）：用于排序类指标。include_full_text=True 回填
+    # _rerank_text 完整正文，让下游 synthesize_answer 的 LLM 看到完整证据
+    # （120 字 snippet 截断会导致「证据充分」被误判为「证据不足」）。
     results = service.search(
         q.query,
         corpus_type=q.corpus_type,
         strategy=strategy,
         top_k=top_k,
+        include_full_text=True,
     )
     ranked_ids = [r.get("id", "") for r in results]
 
@@ -193,16 +197,22 @@ def _run_query(
         k=top_k,
         filter_expected=q.filter_expected if q.filter is not None and q.filter_expected else None,
         filter_returned=filter_returned,
+        fact_groups=q.fact_groups or None,
     )
 
     # P2-6: 生成维度 —— 基于检索命中的上下文生成结构化答案并计算指标。
     # 无论是否有命中都调用 synthesize_answer：空上下文时其内置的
     # 证据不足拒答逻辑会给出 status='refused'，保证「应该拒答」类查询
     # （如隐私越权）能被正确评估，与 CLI/MCP 行为一致。
+    # 内容级去重映射（[0512]）：引用渲染归一到代表 ID + same_content_as
+    # 声明，与真实服务链路同一口径。
     answer = None
     generation_metrics: dict[str, float] = {}
     try:
-        answer = synthesize_answer(q.query, results)
+        answer = synthesize_answer(
+            q.query, results, llm=llm,
+            rep_of=service.representative_map(q.corpus_type),
+        )
     except Exception:
         answer = None
     generation_metrics = query_generation_metrics(
@@ -235,6 +245,7 @@ def run_eval(
     strategies: tuple[str, ...] = DEFAULT_STRATEGIES,
     use_paraphrases: bool = False,
     service: Optional[RetrievalService] = None,
+    llm: Optional[Callable] = None,
 ) -> EvalReport:
     """对评测集跑一组策略，返回 EvalReport。
 
@@ -245,6 +256,9 @@ def run_eval(
         use_paraphrases: 是否把每条同义改写也当独立查询评测 (放大规模)。
         service: 可选预建 RetrievalService 复用 (测试/性能用)；缺省按
             workdir 新建。
+        llm: 可选生成侧 callable（``(请求, 上下文) -> str``），透传给
+            ``synthesize_answer`` 驱动 LLM 生成与拒答判定。缺省 None 走
+            确定性组装路径 —— 与既有行为完全一致。
 
     Returns:
         EvalReport，含逐查询结果与按策略汇总。
@@ -266,9 +280,10 @@ def run_eval(
                 filter_expected=q.filter_expected,
                 expected_refusal=q.expected_refusal,
                 high_risk=q.high_risk,
+                fact_groups=q.fact_groups,
             )
             for strategy in strategies:
-                rows.append(_run_query(svc, q_run, strategy))
+                rows.append(_run_query(svc, q_run, strategy, llm=llm))
     return EvalReport(eval_set=eval_set, rows=rows)
 
 
@@ -318,6 +333,7 @@ def format_summary(report: EvalReport) -> str:
     summary = report.summary()
     metric_labels = {
         "recall@k": "Recall@K",
+        "success@k": "Success@K",
         "mrr": "MRR",
         "ndcg@k": "nDCG@K",
         "filter_accuracy": "FilterAcc",
